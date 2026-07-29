@@ -1,0 +1,14 @@
+.env
+*.log
+__pycache__/
+*.pyc
+
+# Generated datasets and build artifacts
+datasets/
+generated_datasets/
+build/
+dist/
+
+# Local IDE/runtime folders
+.idea/
+.venv/
