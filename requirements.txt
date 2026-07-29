@@ -2,3 +2,6 @@ numpy
 opencv-python-headless
 onnxruntime
 rapidocr-onnxruntime
+paddlepaddle
+paddleocr
+paddlex
