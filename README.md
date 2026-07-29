@@ -118,10 +118,11 @@ generated_datasets/mrz_yolo/
   review/no_mrz/
   data.yaml
   processed.json
-  last_run_annotations.json
+  last_run_annotations.jsonl
+  last_run_summary.json
 ```
 
-The script uses RapidOCR/PaddleOCR text boxes to find MRZ-like lines and writes one YOLO label per detected MRZ block. Review the generated boxes before using them as final detector training data.
+The script uses RapidOCR/PaddleOCR text boxes to find MRZ-like lines and writes one YOLO label per detected MRZ block. Images and labels are written one by one; `processed.json` metadata is flushed in batches controlled by `READMRZ_PROCESSED_BATCH_SIZE`. Review the generated boxes before using them as final detector training data.
 
 ## Review YOLO MRZ Labels
 

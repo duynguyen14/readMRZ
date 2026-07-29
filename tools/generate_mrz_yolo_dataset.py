@@ -318,9 +318,61 @@ def load_processed(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
 
 
+def load_processed_index(path: Path) -> dict[str, dict[str, Any]]:
+    processed = load_processed(path)
+    items = processed.get("items", {})
+    if not isinstance(items, dict):
+        return {}
+    return {
+        key: {
+            "fingerprint": item.get("fingerprint"),
+            "status": item.get("status"),
+        }
+        for key, item in items.items()
+        if isinstance(item, dict)
+    }
+
+
 def save_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def append_jsonl(path: Path, items: dict[str, dict[str, Any]]) -> None:
+    if not items:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a", encoding="utf-8") as output_file:
+        for key, item in items.items():
+            output_file.write(json.dumps({"key": key, **item}, ensure_ascii=False) + "\n")
+
+
+def flush_processed_batch(
+    *,
+    processed_path: Path,
+    run_items_path: Path,
+    batch_items: dict[str, dict[str, Any]],
+    ocr: Any,
+) -> int:
+    if not batch_items:
+        return 0
+
+    processed = load_processed(processed_path)
+    processed_items = processed.setdefault("items", {})
+    if not isinstance(processed_items, dict):
+        processed_items = {}
+        processed["items"] = processed_items
+
+    processed["ocr_engine"] = getattr(ocr, "name", "unknown")
+    if hasattr(ocr, "config_summary"):
+        processed["ocr_config"] = ocr.config_summary()
+    processed["updated_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    processed_items.update(batch_items)
+    save_json(processed_path, processed)
+    append_jsonl(run_items_path, batch_items)
+    flushed = len(batch_items)
+    batch_items.clear()
+    return flushed
 
 
 def normalize_points(box: Any) -> np.ndarray:
@@ -664,53 +716,86 @@ def main() -> int:
         (output_dir / "images" / split).mkdir(parents=True, exist_ok=True)
         (output_dir / "labels" / split).mkdir(parents=True, exist_ok=True)
     processed_path = output_dir / "processed.json"
-    processed = load_processed(processed_path)
-    processed_items = processed.setdefault("items", {})
-    annotations: dict[str, Any] = {"items": []}
+    run_items_path = output_dir / "last_run_annotations.jsonl"
+    run_summary_path = output_dir / "last_run_summary.json"
+    processed_index = {} if args.force else load_processed_index(processed_path)
+    batch_size = max(1, env_int(env, "READMRZ_PROCESSED_BATCH_SIZE", 25))
+    batch_items: dict[str, dict[str, Any]] = {}
+    if run_items_path.exists():
+        run_items_path.unlink()
     ocr = build_ocr(env)
-    processed["ocr_engine"] = getattr(ocr, "name", "unknown")
-    if hasattr(ocr, "config_summary"):
-        processed["ocr_config"] = ocr.config_summary()
     images = list_images(source_dir, output_dir=output_dir)
     if args.limit > 0:
         images = images[: args.limit]
 
     counts = {"labeled": 0, "no_mrz": 0, "error": 0, "skipped": 0}
-    for index, image_path in enumerate(images, start=1):
-        rel_key = str(image_path.relative_to(source_dir)).replace("\\", "/")
-        fingerprint = file_fingerprint(image_path)
-        previous = processed_items.get(rel_key)
-        if (
-            previous
-            and not args.force
-            and previous.get("fingerprint") == fingerprint
-            and previous.get("status") in {"labeled", "no_mrz", "error"}
-        ):
-            counts["skipped"] += 1
-            continue
+    flushed_total = 0
+    try:
+        for index, image_path in enumerate(images, start=1):
+            rel_key = str(image_path.relative_to(source_dir)).replace("\\", "/")
+            fingerprint = file_fingerprint(image_path)
+            previous = processed_index.get(rel_key)
+            if (
+                previous
+                and not args.force
+                and previous.get("fingerprint") == fingerprint
+                and previous.get("status") in {"labeled", "no_mrz", "error"}
+            ):
+                counts["skipped"] += 1
+                continue
 
-        item = process_image(
-            image_path,
-            source_dir=source_dir,
-            output_dir=output_dir,
+            item = process_image(
+                image_path,
+                source_dir=source_dir,
+                output_dir=output_dir,
+                ocr=ocr,
+                env=env,
+            )
+            item["fingerprint"] = fingerprint
+            item["processed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
+            batch_items[rel_key] = item
+            processed_index[rel_key] = {
+                "fingerprint": fingerprint,
+                "status": item.get("status", "error"),
+            }
+            status = item.get("status", "error")
+            counts[status] = counts.get(status, 0) + 1
+            print(
+                f"[{index}/{len(images)}] {status} {rel_key} "
+                f"ocr_ms={item.get('ocr_ms', '-')} elapsed_ms={item.get('elapsed_ms', '-')}"
+            )
+
+            if len(batch_items) >= batch_size:
+                flushed = flush_processed_batch(
+                    processed_path=processed_path,
+                    run_items_path=run_items_path,
+                    batch_items=batch_items,
+                    ocr=ocr,
+                )
+                flushed_total += flushed
+                print(f"Flushed {flushed} processed items to {processed_path}")
+    finally:
+        flushed = flush_processed_batch(
+            processed_path=processed_path,
+            run_items_path=run_items_path,
+            batch_items=batch_items,
             ocr=ocr,
-            env=env,
         )
-        item["fingerprint"] = fingerprint
-        item["processed_at"] = time.strftime("%Y-%m-%d %H:%M:%S")
-        processed_items[rel_key] = item
-        annotations["items"].append(item)
-        status = item.get("status", "error")
-        counts[status] = counts.get(status, 0) + 1
-        print(
-            f"[{index}/{len(images)}] {status} {rel_key} "
-            f"ocr_ms={item.get('ocr_ms', '-')} elapsed_ms={item.get('elapsed_ms', '-')}"
-        )
-        save_json(processed_path, processed)
+        if flushed:
+            flushed_total += flushed
+            print(f"Flushed {flushed} processed items to {processed_path}")
 
     write_data_yaml(output_dir)
-    save_json(output_dir / "last_run_annotations.json", annotations)
-    print(json.dumps({"done": True, "counts": counts, "output_dir": str(output_dir)}, ensure_ascii=False, indent=2))
+    summary = {
+        "done": True,
+        "counts": counts,
+        "output_dir": str(output_dir),
+        "processed_batch_size": batch_size,
+        "flushed_items": flushed_total,
+        "last_run_items_jsonl": str(run_items_path),
+    }
+    save_json(run_summary_path, summary)
+    print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0
 
 

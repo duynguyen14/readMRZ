@@ -8,6 +8,8 @@ datasets/
 generated_datasets/
 build/
 dist/
+tools/images/
+tools/labels/
 
 # Local IDE/runtime folders
 .idea/
