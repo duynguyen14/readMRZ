@@ -213,8 +213,58 @@ def projection_bands(binary: np.ndarray, env: dict[str, str]) -> list[tuple[int,
         bands.append((start, height - 1, float(projection[start:].mean())))
 
     expected = max(1, env_int(env, "READMRZ_OCR_LINE2_EXPECTED_LINES", 2))
+    bands = split_wide_bands_by_valleys(projection, bands, expected, min_band_height)
     bands = sorted(bands, key=lambda item: item[2] * (item[1] - item[0]), reverse=True)[:expected]
     return sorted(bands, key=lambda item: item[0])
+
+
+def split_wide_bands_by_valleys(
+    projection: np.ndarray,
+    bands: list[tuple[int, int, float]],
+    expected: int,
+    min_band_height: int,
+) -> list[tuple[int, int, float]]:
+    if expected <= 1 or len(bands) >= expected or not bands:
+        return bands
+
+    result = list(bands)
+    while len(result) < expected:
+        result.sort(key=lambda item: item[1] - item[0], reverse=True)
+        y1, y2, score = result.pop(0)
+        if y2 - y1 < min_band_height * 3:
+            result.append((y1, y2, score))
+            break
+
+        split_y = find_best_valley(projection, y1, y2, min_band_height)
+        if split_y is None:
+            result.append((y1, y2, score))
+            break
+
+        left = (y1, split_y, float(projection[y1:split_y].mean()))
+        right = (split_y, y2, float(projection[split_y:y2].mean()))
+        result.extend([left, right])
+
+    return result
+
+
+def find_best_valley(projection: np.ndarray, y1: int, y2: int, min_band_height: int) -> int | None:
+    start = y1 + min_band_height
+    end = y2 - min_band_height
+    if end <= start:
+        return None
+
+    band_height = y2 - y1
+    center_start = y1 + int(band_height * 0.30)
+    center_end = y1 + int(band_height * 0.70)
+    start = max(start, center_start)
+    end = min(end, center_end)
+    if end <= start:
+        return None
+
+    window = projection[start:end]
+    if window.size == 0:
+        return None
+    return int(start + int(np.argmin(window)))
 
 
 def crop_line_images(
