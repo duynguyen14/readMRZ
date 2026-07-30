@@ -44,6 +44,13 @@ def resolve_under_base(base_dir: Path, value: Any) -> Path:
     return base_dir / path
 
 
+def resolve_optional_under_base(base_dir: Path, value: Any) -> Path | None:
+    path_text = str(value or "").strip()
+    if not path_text:
+        return None
+    return resolve_under_base(base_dir, path_text)
+
+
 def relative_to_base(path: Path, base_dir: Path) -> str:
     try:
         return path.resolve().relative_to(base_dir.resolve()).as_posix()
@@ -183,12 +190,12 @@ def decode_mrz_lines(value: Any) -> list[str]:
 def artifact_paths(row: dict[str, Any], paths: dict[str, Path]) -> tuple[Path, Path]:
     image_path = resolve_under_base(paths["image_base_dir"], row.get("image_file_name"))
     label_path = resolve_under_base(paths["label_base_dir"], row.get("label_file_name"))
-    if image_path.exists() and label_path.exists():
+    if image_path.is_file() and label_path.is_file():
         return image_path, label_path
 
-    rejected_image = resolve_under_base(paths["dataset_dir"], row.get("rejected_image_file_name"))
-    rejected_label = resolve_under_base(paths["dataset_dir"], row.get("rejected_label_file_name"))
-    if rejected_image.exists() and rejected_label.exists():
+    rejected_image = resolve_optional_under_base(paths["dataset_dir"], row.get("rejected_image_file_name"))
+    rejected_label = resolve_optional_under_base(paths["dataset_dir"], row.get("rejected_label_file_name"))
+    if rejected_image and rejected_label and rejected_image.is_file() and rejected_label.is_file():
         return rejected_image, rejected_label
 
     return image_path, label_path
@@ -292,11 +299,11 @@ def move_rejected_artifacts(row: dict[str, Any], paths: dict[str, Path]) -> dict
     rejected_label_dir.mkdir(parents=True, exist_ok=True)
 
     moved: dict[str, str] = {}
-    if image_path.exists():
+    if image_path.is_file():
         target_image = unique_destination(rejected_image_dir / image_path.name)
         shutil.move(str(image_path), str(target_image))
         moved["rejected_image_file_name"] = relative_to_base(target_image, paths["dataset_dir"])
-    if label_path.exists():
+    if label_path.is_file():
         target_label = unique_destination(rejected_label_dir / label_path.name)
         shutil.move(str(label_path), str(target_label))
         moved["rejected_label_file_name"] = relative_to_base(target_label, paths["dataset_dir"])
@@ -304,18 +311,18 @@ def move_rejected_artifacts(row: dict[str, Any], paths: dict[str, Path]) -> dict
 
 
 def restore_rejected_artifacts(row: dict[str, Any], paths: dict[str, Path]) -> dict[str, str]:
-    rejected_image = resolve_under_base(paths["dataset_dir"], row.get("rejected_image_file_name"))
-    rejected_label = resolve_under_base(paths["dataset_dir"], row.get("rejected_label_file_name"))
+    rejected_image = resolve_optional_under_base(paths["dataset_dir"], row.get("rejected_image_file_name"))
+    rejected_label = resolve_optional_under_base(paths["dataset_dir"], row.get("rejected_label_file_name"))
     target_image = resolve_under_base(paths["image_base_dir"], row.get("image_file_name"))
     target_label = resolve_under_base(paths["label_base_dir"], row.get("label_file_name"))
 
     restored: dict[str, str] = {}
-    if rejected_image.exists():
+    if rejected_image and rejected_image.is_file():
         target_image.parent.mkdir(parents=True, exist_ok=True)
         final_image = unique_destination(target_image)
         shutil.move(str(rejected_image), str(final_image))
         restored["image_file_name"] = relative_to_base(final_image, paths["image_base_dir"])
-    if rejected_label.exists():
+    if rejected_label and rejected_label.is_file():
         target_label.parent.mkdir(parents=True, exist_ok=True)
         final_label = unique_destination(target_label)
         shutil.move(str(rejected_label), str(final_label))
