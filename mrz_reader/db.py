@@ -8,6 +8,15 @@ import pyodbc
 from .env_config import env_value, read_env_file
 
 
+def odbc_yes_no(value: str, default: str = "no") -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"true", "yes", "1", "y"}:
+        return "yes"
+    if normalized in {"false", "no", "0", "n"}:
+        return "no"
+    return default
+
+
 def build_connection_string() -> str:
     env = read_env_file()
     driver = env_value(env, "READMRZ_DB_DRIVER", env_value(env, "SQLSERVER_DRIVER", "ODBC Driver 17 for SQL Server"))
@@ -26,9 +35,9 @@ def build_connection_string() -> str:
         f"DRIVER={{{driver}}}",
         f"SERVER={server}",
         f"DATABASE={database}",
-        f"TrustServerCertificate={trust_server_certificate}",
+        f"TrustServerCertificate={odbc_yes_no(trust_server_certificate, 'yes')}",
     ]
-    if trusted_connection.strip().lower() in {"true", "yes", "1"}:
+    if odbc_yes_no(trusted_connection) == "yes":
         parts.append("Trusted_Connection=yes")
     else:
         parts.extend([f"UID={username}", f"PWD={password}"])
