@@ -5,3 +5,4 @@ rapidocr-onnxruntime
 paddlepaddle
 paddleocr
 paddlex
+pyodbc
