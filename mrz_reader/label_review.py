@@ -78,6 +78,28 @@ def bbox_percent(bbox_xyxy: list[float], width: int, height: int) -> dict[str, f
     }
 
 
+def clamp_bbox_xyxy(bbox_xyxy: list[Any], width: int, height: int) -> list[float]:
+    if len(bbox_xyxy) != 4:
+        raise ValueError("bbox_xyxy must have 4 values")
+    x1, y1, x2, y2 = [float(value) for value in bbox_xyxy]
+    left = max(0.0, min(x1, x2, float(width)))
+    top = max(0.0, min(y1, y2, float(height)))
+    right = max(0.0, min(max(x1, x2), float(width)))
+    bottom = max(0.0, min(max(y1, y2), float(height)))
+    if right - left < 4 or bottom - top < 4:
+        raise ValueError("bbox is too small")
+    return [round(left, 2), round(top, 2), round(right, 2), round(bottom, 2)]
+
+
+def yolo_label_from_bbox(bbox_xyxy: list[float], width: int, height: int) -> str:
+    x1, y1, x2, y2 = bbox_xyxy
+    x_center = ((x1 + x2) / 2.0) / width
+    y_center = ((y1 + y2) / 2.0) / height
+    box_width = (x2 - x1) / width
+    box_height = (y2 - y1) / height
+    return f"0 {x_center:.6f} {y_center:.6f} {box_width:.6f} {box_height:.6f}"
+
+
 def review_stats(cursor: Any) -> dict[str, int]:
     cursor.execute(
         """
@@ -121,7 +143,7 @@ def pending_candidates(cursor: Any, min_id: int) -> list[dict[str, Any]]:
 
 def row_artifacts_exist(row: dict[str, Any], paths: dict[str, Path]) -> bool:
     image_path, label_path = artifact_paths(row, paths)
-    return image_path.exists() and label_path.exists()
+    return image_path.is_file() and label_path.is_file()
 
 
 def next_pending_row(cursor: Any, after_key: str, paths: dict[str, Path]) -> dict[str, Any] | None:
@@ -330,6 +352,17 @@ def restore_rejected_artifacts(row: dict[str, Any], paths: dict[str, Path]) -> d
     return restored
 
 
+def ensure_train_artifacts(row: dict[str, Any], paths: dict[str, Path]) -> dict[str, str]:
+    if str(row.get("review_status") or "") == "rejected":
+        return restore_rejected_artifacts(row, paths)
+    return {}
+
+
+def write_yolo_label(label_path: Path, yolo_label: str) -> None:
+    label_path.parent.mkdir(parents=True, exist_ok=True)
+    label_path.write_text(yolo_label + "\n", encoding="utf-8")
+
+
 def fetch_review_row(cursor: Any, key: str) -> dict[str, Any] | None:
     cursor.execute("SELECT * FROM dbo.readmrz_label_items WHERE source_key = ?", key)
     return fetch_one_dict(cursor)
@@ -388,3 +421,77 @@ def submit_review_decision(key: str, decision: str) -> dict[str, Any]:
         "next": next_response.get("current"),
         "stats": next_response.get("stats", {}),
     }
+
+
+def correct_review_box(key: str, bbox_xyxy: list[Any]) -> dict[str, Any]:
+    paths = review_paths()
+    with connect() as connection:
+        cursor = connection.cursor()
+        row = fetch_review_row(cursor, key)
+        if row is None:
+            raise KeyError(f"Review item not found: {key}")
+
+        restored = ensure_train_artifacts(row, paths)
+        if restored:
+            row = {**row, **restored, "review_status": "approved"}
+
+        image_path = resolve_under_base(paths["image_base_dir"], row.get("image_file_name"))
+        image = cv2.imread(str(image_path))
+        if image is None:
+            raise ValueError(f"Cannot read image for corrected box: {image_path}")
+        height, width = image.shape[:2]
+        corrected_bbox = clamp_bbox_xyxy(bbox_xyxy, width, height)
+        yolo_label = yolo_label_from_bbox(corrected_bbox, width, height)
+        label_path = resolve_under_base(paths["label_base_dir"], row.get("label_file_name"))
+        write_yolo_label(label_path, yolo_label)
+
+        cursor.execute(
+            """
+            UPDATE dbo.readmrz_label_items
+            SET review_status = 'approved',
+                image_file_name = COALESCE(?, image_file_name),
+                label_file_name = COALESCE(?, label_file_name),
+                rejected_image_file_name = NULL,
+                rejected_label_file_name = NULL,
+                bbox_x1 = ?,
+                bbox_y1 = ?,
+                bbox_x2 = ?,
+                bbox_y2 = ?,
+                yolo_label = ?,
+                reviewed_at = SYSUTCDATETIME(),
+                updated_at = SYSUTCDATETIME()
+            WHERE source_key = ?
+            """,
+            restored.get("image_file_name"),
+            restored.get("label_file_name"),
+            corrected_bbox[0],
+            corrected_bbox[1],
+            corrected_bbox[2],
+            corrected_bbox[3],
+            yolo_label,
+            key,
+        )
+        cursor.execute(
+            """
+            INSERT INTO dbo.readmrz_label_review_history (label_item_id, source_key, decision, note)
+            VALUES (?, ?, 'approved', ?)
+            """,
+            row["id"],
+            key,
+            "corrected_box",
+        )
+        connection.commit()
+
+        refreshed = fetch_review_row(cursor, key)
+        stats = review_stats(cursor)
+        if refreshed is None:
+            raise KeyError(f"Review item not found after correction: {key}")
+        return {
+            "status": "ok",
+            "key": key,
+            "corrected_bbox_xyxy": corrected_bbox,
+            "yolo_label": yolo_label,
+            "restored": restored,
+            "current": build_review_item(cursor, refreshed, stats, paths),
+            "stats": stats,
+        }

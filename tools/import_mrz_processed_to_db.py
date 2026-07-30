@@ -55,11 +55,13 @@ def bbox_values(item: dict[str, Any]) -> tuple[float | None, float | None, float
     return tuple(float(value) for value in bbox)  # type: ignore[return-value]
 
 
-def normalize_review_status(item: dict[str, Any]) -> str:
+def normalize_review_status(item: dict[str, Any]) -> str | None:
     review_status = str(item.get("review_status") or "").strip().lower()
     if review_status in {"approved", "rejected"}:
         return review_status
-    return "pending"
+    if review_status == "pending":
+        return "pending"
+    return None
 
 
 def normalize_status(item: dict[str, Any]) -> str:
@@ -76,7 +78,7 @@ def upsert_item(cursor: Any, row: dict[str, Any]) -> None:
         SET
             source_file_name = ?,
             status = ?,
-            review_status = ?,
+            review_status = COALESCE(?, review_status),
             split = ?,
             image_file_name = ?,
             label_file_name = ?,
@@ -164,7 +166,7 @@ def upsert_item(cursor: Any, row: dict[str, Any]) -> None:
         row["source_key"],
         row["source_file_name"],
         row["status"],
-        row["review_status"],
+        row["review_status"] or "pending",
         row["split"],
         row["image_file_name"],
         row["label_file_name"],

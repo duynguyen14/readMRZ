@@ -208,6 +208,7 @@ class PaddleOcrAdapter:
             return []
 
         item = result[0]
+        doc_orientation_angle = extract_doc_orientation_angle(item)
         rows: list[dict[str, Any]] = []
         for text, score, raw_polygon, raw_box in zip(
             item.get("rec_texts", []),
@@ -216,7 +217,15 @@ class PaddleOcrAdapter:
             item.get("rec_boxes", []),
             strict=False,
         ):
-            row = row_from_paddleocr(text, score, raw_polygon, raw_box, height, width)
+            row = row_from_paddleocr(
+                text,
+                score,
+                raw_polygon,
+                raw_box,
+                height,
+                width,
+                doc_orientation_angle=doc_orientation_angle,
+            )
             if row is not None:
                 rows.append(row)
         return rows
@@ -382,6 +391,57 @@ def normalize_points(box: Any) -> np.ndarray:
     return points
 
 
+def normalize_angle(value: Any) -> int:
+    try:
+        angle = int(round(float(value))) % 360
+    except (TypeError, ValueError):
+        return 0
+    return angle if angle in {0, 90, 180, 270} else 0
+
+
+def extract_doc_orientation_angle(item: dict[str, Any]) -> int:
+    candidates: list[Any] = []
+    doc_preprocessor = item.get("doc_preprocessor_res")
+    if isinstance(doc_preprocessor, dict):
+        for key in ("angle", "doc_orientation_angle", "doc_ori_angle", "orientation_angle", "rotate_angle"):
+            if key in doc_preprocessor:
+                candidates.append(doc_preprocessor.get(key))
+
+    for key in ("doc_orientation_angle", "doc_ori_angle", "orientation_angle", "rotate_angle"):
+        if key in item:
+            candidates.append(item.get(key))
+
+    for value in candidates:
+        angle = normalize_angle(value)
+        if angle:
+            return angle
+    return 0
+
+
+def map_corrected_points_to_original(points: np.ndarray, angle: int, image_width: int, image_height: int) -> np.ndarray:
+    normalized_angle = normalize_angle(angle)
+    if normalized_angle == 0:
+        return points
+
+    mapped = points.astype(np.float32, copy=True)
+    x = mapped[:, 0].copy()
+    y = mapped[:, 1].copy()
+
+    if normalized_angle == 180:
+        mapped[:, 0] = image_width - 1 - x
+        mapped[:, 1] = image_height - 1 - y
+    elif normalized_angle == 90:
+        mapped[:, 0] = image_width - 1 - y
+        mapped[:, 1] = x
+    elif normalized_angle == 270:
+        mapped[:, 0] = y
+        mapped[:, 1] = image_height - 1 - x
+
+    mapped[:, 0] = np.clip(mapped[:, 0], 0, max(0, image_width - 1))
+    mapped[:, 1] = np.clip(mapped[:, 1], 0, max(0, image_height - 1))
+    return mapped
+
+
 def build_row_from_points(
     *,
     text: str,
@@ -448,6 +508,7 @@ def row_from_paddleocr(
     raw_box: Any,
     image_height: int,
     image_width: int,
+    doc_orientation_angle: int = 0,
 ) -> dict[str, Any] | None:
     try:
         points = normalize_points(raw_polygon)
@@ -465,18 +526,23 @@ def row_from_paddleocr(
         except Exception:
             return None
 
+    points = map_corrected_points_to_original(points, doc_orientation_angle, image_width, image_height)
+
     try:
         score_value = float(score)
     except (TypeError, ValueError):
         score_value = 0.0
 
-    return build_row_from_points(
+    row = build_row_from_points(
         text=str(text),
         score=score_value,
         points=points,
         image_height=image_height,
         image_width=image_width,
     )
+    if row is not None:
+        row["doc_orientation_angle"] = doc_orientation_angle
+    return row
 
 
 def group_score(group: list[dict[str, Any]], image_height: int, image_width: int) -> float:
@@ -659,6 +725,7 @@ def process_image(
         "yolo_label": output_label.read_text(encoding="utf-8").strip(),
         "mrz_lines": [row["normalized"] for row in group],
         "mrz_score": round(score, 4),
+        "doc_orientation_angle": int(group[0].get("doc_orientation_angle", 0)) if group else 0,
         "ocr_ms": ocr_ms,
         "elapsed_ms": int((time.perf_counter() - started) * 1000),
     }

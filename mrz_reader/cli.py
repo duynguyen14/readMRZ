@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
-from .label_review import get_next_review_item, get_previous_review_item, submit_review_decision
+from .label_review import correct_review_box, get_next_review_item, get_previous_review_item, submit_review_decision
 from .mrz import parse_mrz, result_to_dict
 from .ocr import MrzOcrEngine
 
@@ -164,6 +164,22 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(200, result)
                 except Exception as exc:
                     log_api(f"LABEL_REVIEW error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/label-review/correct-box":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    payload = json.loads(data.decode("utf-8")) if data else {}
+                    key = str(payload.get("key") or "")
+                    bbox_xyxy = payload.get("bbox_xyxy") or []
+                    if not key:
+                        raise ValueError("key is required")
+                    result = correct_review_box(key, bbox_xyxy)
+                    self.send_json(200, result)
+                except Exception as exc:
+                    log_api(f"LABEL_REVIEW_CORRECT_BOX error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 return
 
