@@ -10,11 +10,14 @@ Run local API server from source:
 python main.py
 ```
 
-The API listens at:
+The API bind host and port are configured in `.env`:
 
 ```text
-http://127.0.0.1:8080
+READMRZ_API_HOST=0.0.0.0
+READMRZ_API_PORT=8080
 ```
+
+On the same machine, call `http://127.0.0.1:8080`. From LAN, call `http://<server-lan-ip>:8080`.
 
 ```powershell
 python -m mrz_reader.cli "path\to\passport.jpg" --pretty

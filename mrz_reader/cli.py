@@ -97,7 +97,7 @@ def decode_request_image(data: bytes, content_type: str):
     return decode_image_bytes(data), "raw_image_request"
 
 
-def run_server(port: int) -> int:
+def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     engine: MrzOcrEngine | None = None
 
     def get_engine() -> MrzOcrEngine:
@@ -186,8 +186,9 @@ def run_server(port: int) -> int:
                 log_api(f"READ error {exc}")
                 self.send_json(400, {"found": False, "confidence": 0.0, "error": str(exc)})
 
-    server = ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    log_api(f"READMRZ server listening on http://127.0.0.1:{port}")
+    server = ThreadingHTTPServer((host, port), Handler)
+    display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
+    log_api(f"READMRZ server listening on http://{display_host}:{port} bind={host}:{port}")
     log_api("POST JSON {\"image_base64\":\"...\"} to /read")
     try:
         server.serve_forever()
@@ -217,13 +218,18 @@ def build_parser() -> argparse.ArgumentParser:
         metavar="PORT",
         help="Run a local HTTP server and keep the OCR model warm in memory.",
     )
+    parser.add_argument(
+        "--host",
+        default="127.0.0.1",
+        help="Bind host for --server. Use 0.0.0.0 for LAN access.",
+    )
     return parser
 
 
 def main(argv: list[str] | None = None) -> int:
     args = build_parser().parse_args(argv)
     if args.server:
-        return run_server(args.server)
+        return run_server(args.server, host=args.host)
     if not args.image:
         print("Missing image path. Use --help for usage.", file=sys.stderr)
         return 1
