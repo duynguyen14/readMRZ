@@ -15,6 +15,7 @@ import numpy as np
 from .label_review import correct_review_box, get_next_review_item, get_previous_review_item, submit_review_decision
 from .mrz import parse_mrz, result_to_dict
 from .ocr import MrzOcrEngine
+from .ocr_line_review import get_next_ocr_line_review_item, submit_ocr_line_review_decision
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "readmrz-api.log"
@@ -146,6 +147,11 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 before_key = params.get("before_key", [""])[0]
                 self.send_json(200, get_previous_review_item(before_key))
                 return
+            if parsed_url.path == "/ocr-line-review/next":
+                params = parse_qs(parsed_url.query)
+                after_id = int(params.get("after_id", ["0"])[0] or "0")
+                self.send_json(200, get_next_ocr_line_review_item(after_id))
+                return
             self.send_json(404, {"error": "Unknown route"})
 
         def do_POST(self) -> None:
@@ -180,6 +186,23 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(200, result)
                 except Exception as exc:
                     log_api(f"LABEL_REVIEW_CORRECT_BOX error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/ocr-line-review/decision":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    payload = json.loads(data.decode("utf-8")) if data else {}
+                    line_id = int(payload.get("id") or 0)
+                    decision = str(payload.get("decision") or "")
+                    final_text = str(payload.get("final_text") or "")
+                    if line_id <= 0:
+                        raise ValueError("id is required")
+                    result = submit_ocr_line_review_decision(line_id, decision, final_text)
+                    self.send_json(200, result)
+                except Exception as exc:
+                    log_api(f"OCR_LINE_REVIEW error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 return
 
