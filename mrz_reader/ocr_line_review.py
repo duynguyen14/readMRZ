@@ -12,6 +12,9 @@ from .env_config import env_value, read_env_file
 from .mrz import normalize_mrz_text
 
 
+LINE_REVIEW_TABLE = "dbo.readmrz_ocr_line_items2"
+
+
 def line_paths() -> dict[str, Path]:
     env = read_env_file()
     dataset_dir = Path(
@@ -59,7 +62,7 @@ def review_stats(cursor: Any) -> dict[str, int]:
             SUM(CASE WHEN review_status = 'pending' THEN 1 ELSE 0 END) AS pending,
             SUM(CASE WHEN review_status = 'approved' THEN 1 ELSE 0 END) AS approved,
             SUM(CASE WHEN review_status = 'rejected' THEN 1 ELSE 0 END) AS rejected
-        FROM dbo.readmrz_ocr_line_items
+        FROM dbo.readmrz_ocr_line_items2
         """
     )
     row = fetch_one_dict(cursor) or {}
@@ -71,7 +74,7 @@ def next_pending_row(cursor: Any, after_id: int) -> dict[str, Any] | None:
         cursor.execute(
             """
             SELECT TOP 1 *
-            FROM dbo.readmrz_ocr_line_items
+            FROM dbo.readmrz_ocr_line_items2
             WHERE id > ?
               AND review_status = 'pending'
             ORDER BY id ASC
@@ -82,6 +85,24 @@ def next_pending_row(cursor: Any, after_id: int) -> dict[str, Any] | None:
         if row:
             return row
     return None
+
+
+def previous_line_row(cursor: Any, before_id: int) -> dict[str, Any] | None:
+    if before_id <= 0:
+        cursor.execute("SELECT ISNULL(MAX(id) + 1, 0) FROM dbo.readmrz_ocr_line_items2")
+        row = cursor.fetchone()
+        before_id = int(row[0] or 0) if row else 0
+
+    cursor.execute(
+        """
+        SELECT TOP 1 *
+        FROM dbo.readmrz_ocr_line_items2
+        WHERE id < ?
+        ORDER BY id DESC
+        """,
+        before_id,
+    )
+    return fetch_one_dict(cursor)
 
 
 def build_review_item(row: dict[str, Any], image_base_dir: Path) -> dict[str, Any]:
@@ -127,6 +148,25 @@ def get_next_ocr_line_review_item(after_id: int = 0) -> dict[str, Any]:
         }
 
 
+def get_previous_ocr_line_review_item(before_id: int = 0) -> dict[str, Any]:
+    paths = line_paths()
+    with connect() as connection:
+        cursor = connection.cursor()
+        row = previous_line_row(cursor, before_id)
+        stats = review_stats(cursor)
+        if row is None:
+            return {
+                "status": "empty",
+                "current": None,
+                "stats": stats,
+            }
+        return {
+            "status": "ok",
+            "current": build_review_item(row, paths["image_base_dir"]),
+            "stats": stats,
+        }
+
+
 def submit_ocr_line_review_decision(line_id: int, decision: str, final_text: str = "") -> dict[str, Any]:
     if decision not in {"approved", "rejected"}:
         raise ValueError("decision must be approved or rejected")
@@ -134,7 +174,7 @@ def submit_ocr_line_review_decision(line_id: int, decision: str, final_text: str
     normalized_final = normalize_mrz_text(final_text) if final_text else None
     with connect() as connection:
         cursor = connection.cursor()
-        cursor.execute("SELECT * FROM dbo.readmrz_ocr_line_items WHERE id = ?", line_id)
+        cursor.execute("SELECT * FROM dbo.readmrz_ocr_line_items2 WHERE id = ?", line_id)
         row = fetch_one_dict(cursor)
         if row is None:
             raise KeyError(f"OCR line item not found: {line_id}")
@@ -144,7 +184,7 @@ def submit_ocr_line_review_decision(line_id: int, decision: str, final_text: str
 
         cursor.execute(
             """
-            UPDATE dbo.readmrz_ocr_line_items
+            UPDATE dbo.readmrz_ocr_line_items2
             SET review_status = ?,
                 final_text = COALESCE(?, final_text),
                 reviewed_at = SYSUTCDATETIME(),

@@ -15,7 +15,11 @@ import numpy as np
 from .label_review import correct_review_box, get_next_review_item, get_previous_review_item, submit_review_decision
 from .mrz import parse_mrz, result_to_dict
 from .ocr import MrzOcrEngine
-from .ocr_line_review import get_next_ocr_line_review_item, submit_ocr_line_review_decision
+from .ocr_line_review import (
+    get_next_ocr_line_review_item,
+    get_previous_ocr_line_review_item,
+    submit_ocr_line_review_decision,
+)
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "readmrz-api.log"
@@ -151,6 +155,11 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 params = parse_qs(parsed_url.query)
                 after_id = int(params.get("after_id", ["0"])[0] or "0")
                 self.send_json(200, get_next_ocr_line_review_item(after_id))
+                return
+            if parsed_url.path == "/ocr-line-review/previous":
+                params = parse_qs(parsed_url.query)
+                before_id = int(params.get("before_id", ["0"])[0] or "0")
+                self.send_json(200, get_previous_ocr_line_review_item(before_id))
                 return
             self.send_json(404, {"error": "Unknown route"})
 
