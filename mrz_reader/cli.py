@@ -12,7 +12,7 @@ from urllib.parse import parse_qs, urlparse
 import cv2
 import numpy as np
 
-from .label_review import get_next_review_item, submit_review_decision
+from .label_review import get_next_review_item, get_previous_review_item, submit_review_decision
 from .mrz import parse_mrz, result_to_dict
 from .ocr import MrzOcrEngine
 
@@ -140,6 +140,11 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 params = parse_qs(parsed_url.query)
                 after_key = params.get("after_key", [""])[0]
                 self.send_json(200, get_next_review_item(after_key))
+                return
+            if parsed_url.path == "/label-review/previous":
+                params = parse_qs(parsed_url.query)
+                before_key = params.get("before_key", [""])[0]
+                self.send_json(200, get_previous_review_item(before_key))
                 return
             self.send_json(404, {"error": "Unknown route"})
 

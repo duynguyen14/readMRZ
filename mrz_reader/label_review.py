@@ -113,8 +113,7 @@ def pending_candidates(cursor: Any, min_id: int) -> list[dict[str, Any]]:
 
 
 def row_artifacts_exist(row: dict[str, Any], paths: dict[str, Path]) -> bool:
-    image_path = resolve_under_base(paths["image_base_dir"], row.get("image_file_name"))
-    label_path = resolve_under_base(paths["label_base_dir"], row.get("label_file_name"))
+    image_path, label_path = artifact_paths(row, paths)
     return image_path.exists() and label_path.exists()
 
 
@@ -127,13 +126,40 @@ def next_pending_row(cursor: Any, after_key: str, paths: dict[str, Path]) -> dic
     return None
 
 
-def pending_position(cursor: Any, row_id: int) -> int:
+def previous_candidates(cursor: Any, max_id: int) -> list[dict[str, Any]]:
+    cursor.execute(
+        """
+        SELECT TOP 50 *
+        FROM dbo.readmrz_label_items
+        WHERE id < ?
+          AND status = 'labeled'
+          AND image_file_name IS NOT NULL
+          AND label_file_name IS NOT NULL
+        ORDER BY id DESC
+        """,
+        max_id,
+    )
+    return [row_to_dict(cursor, row) for row in cursor.fetchall()]
+
+
+def previous_review_row(cursor: Any, before_key: str, paths: dict[str, Path]) -> dict[str, Any] | None:
+    start_id = after_id(cursor, before_key)
+    if start_id <= 0:
+        cursor.execute("SELECT ISNULL(MAX(id) + 1, 0) FROM dbo.readmrz_label_items WHERE status = 'labeled'")
+        row = cursor.fetchone()
+        start_id = int(row[0] or 0) if row else 0
+    for row in previous_candidates(cursor, start_id):
+        if row_artifacts_exist(row, paths):
+            return row
+    return None
+
+
+def label_position(cursor: Any, row_id: int) -> int:
     cursor.execute(
         """
         SELECT COUNT(*)
         FROM dbo.readmrz_label_items
         WHERE status = 'labeled'
-          AND review_status = 'pending'
           AND id <= ?
         """,
         row_id,
@@ -154,14 +180,27 @@ def decode_mrz_lines(value: Any) -> list[str]:
     return [str(line) for line in parsed]
 
 
+def artifact_paths(row: dict[str, Any], paths: dict[str, Path]) -> tuple[Path, Path]:
+    image_path = resolve_under_base(paths["image_base_dir"], row.get("image_file_name"))
+    label_path = resolve_under_base(paths["label_base_dir"], row.get("label_file_name"))
+    if image_path.exists() and label_path.exists():
+        return image_path, label_path
+
+    rejected_image = resolve_under_base(paths["dataset_dir"], row.get("rejected_image_file_name"))
+    rejected_label = resolve_under_base(paths["dataset_dir"], row.get("rejected_label_file_name"))
+    if rejected_image.exists() and rejected_label.exists():
+        return rejected_image, rejected_label
+
+    return image_path, label_path
+
+
 def build_review_item(
     cursor: Any,
     row: dict[str, Any],
     stats: dict[str, int],
     paths: dict[str, Path],
 ) -> dict[str, Any]:
-    image_path = resolve_under_base(paths["image_base_dir"], row.get("image_file_name"))
-    label_path = resolve_under_base(paths["label_base_dir"], row.get("label_file_name"))
+    image_path, label_path = artifact_paths(row, paths)
     image_base64, content_type, width, height = image_to_base64(image_path)
     bbox_xyxy = [row.get("bbox_x1"), row.get("bbox_y1"), row.get("bbox_x2"), row.get("bbox_y2")]
     if any(value is None for value in bbox_xyxy):
@@ -186,7 +225,8 @@ def build_review_item(
         "mrz_lines": decode_mrz_lines(row.get("mrz_lines_json")),
         "mrz_score": row.get("mrz_score") or 0,
         "ocr_ms": row.get("ocr_ms") or 0,
-        "position": pending_position(cursor, int(row["id"])),
+        "review_status": row.get("review_status") or "",
+        "position": label_position(cursor, int(row["id"])),
         "stats": stats,
     }
 
@@ -196,6 +236,25 @@ def get_next_review_item(after_key: str = "") -> dict[str, Any]:
     with connect() as connection:
         cursor = connection.cursor()
         row = next_pending_row(cursor, after_key, paths)
+        stats = review_stats(cursor)
+        if row is None:
+            return {
+                "status": "empty",
+                "current": None,
+                "stats": stats,
+            }
+        return {
+            "status": "ok",
+            "current": build_review_item(cursor, row, stats, paths),
+            "stats": stats,
+        }
+
+
+def get_previous_review_item(before_key: str = "") -> dict[str, Any]:
+    paths = review_paths()
+    with connect() as connection:
+        cursor = connection.cursor()
+        row = previous_review_row(cursor, before_key, paths)
         stats = review_stats(cursor)
         if row is None:
             return {
@@ -244,6 +303,26 @@ def move_rejected_artifacts(row: dict[str, Any], paths: dict[str, Path]) -> dict
     return moved
 
 
+def restore_rejected_artifacts(row: dict[str, Any], paths: dict[str, Path]) -> dict[str, str]:
+    rejected_image = resolve_under_base(paths["dataset_dir"], row.get("rejected_image_file_name"))
+    rejected_label = resolve_under_base(paths["dataset_dir"], row.get("rejected_label_file_name"))
+    target_image = resolve_under_base(paths["image_base_dir"], row.get("image_file_name"))
+    target_label = resolve_under_base(paths["label_base_dir"], row.get("label_file_name"))
+
+    restored: dict[str, str] = {}
+    if rejected_image.exists():
+        target_image.parent.mkdir(parents=True, exist_ok=True)
+        final_image = unique_destination(target_image)
+        shutil.move(str(rejected_image), str(final_image))
+        restored["image_file_name"] = relative_to_base(final_image, paths["image_base_dir"])
+    if rejected_label.exists():
+        target_label.parent.mkdir(parents=True, exist_ok=True)
+        final_label = unique_destination(target_label)
+        shutil.move(str(rejected_label), str(final_label))
+        restored["label_file_name"] = relative_to_base(final_label, paths["label_base_dir"])
+    return restored
+
+
 def fetch_review_row(cursor: Any, key: str) -> dict[str, Any] | None:
     cursor.execute("SELECT * FROM dbo.readmrz_label_items WHERE source_key = ?", key)
     return fetch_one_dict(cursor)
@@ -261,19 +340,24 @@ def submit_review_decision(key: str, decision: str) -> dict[str, Any]:
             raise KeyError(f"Review item not found: {key}")
 
         moved = move_rejected_artifacts(row, paths) if decision == "rejected" else {}
+        restored = restore_rejected_artifacts(row, paths) if decision == "approved" else {}
         cursor.execute(
             """
             UPDATE dbo.readmrz_label_items
             SET review_status = ?,
-                rejected_image_file_name = COALESCE(?, rejected_image_file_name),
-                rejected_label_file_name = COALESCE(?, rejected_label_file_name),
+                image_file_name = COALESCE(?, image_file_name),
+                label_file_name = COALESCE(?, label_file_name),
+                rejected_image_file_name = ?,
+                rejected_label_file_name = ?,
                 reviewed_at = SYSUTCDATETIME(),
                 updated_at = SYSUTCDATETIME()
             WHERE source_key = ?
             """,
             decision,
-            moved.get("rejected_image_file_name"),
-            moved.get("rejected_label_file_name"),
+            restored.get("image_file_name"),
+            restored.get("label_file_name"),
+            None if decision == "approved" else moved.get("rejected_image_file_name") or row.get("rejected_image_file_name"),
+            None if decision == "approved" else moved.get("rejected_label_file_name") or row.get("rejected_label_file_name"),
             key,
         )
         cursor.execute(
@@ -293,6 +377,7 @@ def submit_review_decision(key: str, decision: str) -> dict[str, Any]:
         "decision": decision,
         "key": key,
         "moved": moved,
+        "restored": restored,
         "next": next_response.get("current"),
         "stats": next_response.get("stats", {}),
     }
