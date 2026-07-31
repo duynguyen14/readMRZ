@@ -3,12 +3,20 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
 import tempfile
 import time
 from typing import Any
+
+# Paddle 3.x on Windows CPU can enter a PIR/oneDNN path that fails for
+# PaddleOCR orientation models. Set these before importing Paddle/PaddleOCR.
+os.environ.setdefault("FLAGS_use_onednn", "0")
+os.environ.setdefault("FLAGS_use_mkldnn", "0")
+os.environ.setdefault("FLAGS_enable_pir_api", "0")
+os.environ.setdefault("PADDLE_PDX_MODEL_SOURCE", "BOS")
 
 import cv2
 import numpy as np
@@ -27,6 +35,10 @@ from generate_mrz_yolo_dataset import (  # noqa: E402
     env_value,
     line_mrz_likeness,
     read_env_file,
+)
+from generate_mrz_ocr_line_dataset import (  # noqa: E402
+    ocr_rows_for_crop,
+    select_mrz_line_rows,
 )
 from mrz_reader.db import connect, execute_sql_file  # noqa: E402
 from mrz_reader.env_config import yolo_dataset_dir  # noqa: E402
@@ -76,6 +88,17 @@ def ensure_line2_schema() -> None:
     execute_sql_file(PROJECT_ROOT / "sql" / "create_mrz_ocr_line2_tables.sql")
 
 
+def line2_ocr_env(env: dict[str, str]) -> dict[str, str]:
+    ocr_env = dict(env)
+    # The image passed to Paddle here is already a single deskewed MRZ line.
+    # Running document/textline orientation again is slower and can trigger
+    # Paddle PIR/oneDNN runtime errors on Windows CPU.
+    ocr_env["READMRZ_PADDLE_FAST_MODE"] = "true"
+    ocr_env["PADDLE_USE_DOC_ORIENTATION_CLASSIFY"] = "false"
+    ocr_env["PADDLE_USE_TEXTLINE_ORIENTATION"] = "false"
+    return ocr_env
+
+
 def fetch_approved_label_items(
     cursor: Any,
     *,
@@ -98,6 +121,7 @@ def fetch_approved_label_items(
             source_key,
             split,
             image_file_name,
+            mrz_lines_json,
             bbox_x1,
             bbox_y1,
             bbox_x2,
@@ -156,32 +180,79 @@ def normalize_min_area_angle(rect: tuple[Any, Any, float]) -> float:
 
 
 def estimate_skew_angle(binary: np.ndarray, env: dict[str, str]) -> float:
+    max_angle = env_float(env, "READMRZ_OCR_LINE2_MAX_DESKEW_ANGLE", 15.0)
     kernel_width = max(3, env_int(env, "READMRZ_OCR_LINE2_DILATE_KERNEL_WIDTH", 35))
     kernel_height = max(1, env_int(env, "READMRZ_OCR_LINE2_DILATE_KERNEL_HEIGHT", 3))
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_width, kernel_height))
     dilated = cv2.dilate(binary, kernel, iterations=1)
     contours, _ = cv2.findContours(dilated, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if not contours:
-        return 0.0
-
     image_height, image_width = binary.shape[:2]
-    candidates: list[tuple[float, np.ndarray]] = []
+    candidates: list[tuple[float, float]] = []
     for contour in contours:
         x, y, w, h = cv2.boundingRect(contour)
         if w < image_width * 0.25 or h < 3:
             continue
+        if w > image_width * 0.95 and h > image_height * 0.70:
+            continue
         score = float(w * h) * (w / max(1, h))
-        candidates.append((score, contour))
-    if not candidates:
-        return 0.0
+        angle = normalize_min_area_angle(cv2.minAreaRect(contour))
+        if abs(angle) <= max_angle:
+            candidates.append((score, angle))
 
-    candidates.sort(key=lambda pair: pair[0], reverse=True)
-    contour = candidates[0][1]
-    angle = normalize_min_area_angle(cv2.minAreaRect(contour))
-    max_angle = env_float(env, "READMRZ_OCR_LINE2_MAX_DESKEW_ANGLE", 15.0)
-    if abs(angle) > max_angle:
-        return 0.0
-    return angle
+    hough_angle = estimate_skew_angle_hough(binary, max_angle)
+    if hough_angle is not None:
+        return hough_angle
+
+    if candidates:
+        candidates.sort(key=lambda pair: pair[0], reverse=True)
+        return candidates[0][1]
+
+    component_angle = estimate_skew_angle_components(binary, max_angle)
+    return component_angle if component_angle is not None else 0.0
+
+
+def estimate_skew_angle_hough(binary: np.ndarray, max_angle: float) -> float | None:
+    edges = cv2.Canny(binary, 50, 150, apertureSize=3)
+    lines = cv2.HoughLinesP(
+        edges,
+        1,
+        np.pi / 180.0,
+        threshold=30,
+        minLineLength=max(60, int(binary.shape[1] * 0.12)),
+        maxLineGap=20,
+    )
+    if lines is None:
+        return None
+
+    angles: list[float] = []
+    for x1, y1, x2, y2 in lines[:, 0]:
+        if abs(int(x2) - int(x1)) < 30:
+            continue
+        angle = float(np.degrees(np.arctan2(int(y2) - int(y1), int(x2) - int(x1))))
+        if abs(angle) <= max_angle:
+            angles.append(angle)
+
+    if len(angles) < 3:
+        return None
+    return float(np.median(angles))
+
+
+def estimate_skew_angle_components(binary: np.ndarray, max_angle: float) -> float | None:
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+    points: list[tuple[float, float]] = []
+    for index in range(1, count):
+        _, _, width, height, area = stats[index]
+        if 3 <= width <= 45 and 6 <= height <= 55 and area >= 10:
+            points.append((float(centroids[index][0]), float(centroids[index][1])))
+
+    if len(points) < 8:
+        return None
+
+    xs = np.array([point[0] for point in points], dtype=np.float32)
+    ys = np.array([point[1] for point in points], dtype=np.float32)
+    slope, _ = np.polyfit(xs, ys, 1)
+    angle = float(np.degrees(np.arctan(float(slope))))
+    return angle if abs(angle) <= max_angle else None
 
 
 def rotate_image(image: np.ndarray, angle: float, border_value: tuple[int, int, int] | int) -> np.ndarray:
@@ -208,6 +279,11 @@ def deskew_crop(crop: np.ndarray, env: dict[str, str]) -> tuple[np.ndarray, np.n
 
 
 def projection_bands(binary: np.ndarray, env: dict[str, str]) -> list[tuple[int, int, float]]:
+    expected = max(1, env_int(env, "READMRZ_OCR_LINE2_EXPECTED_LINES", 2))
+    component_bands = connected_component_line_bands(binary, expected)
+    if len(component_bands) >= expected:
+        return component_bands
+
     height, _ = binary.shape[:2]
     kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 2))
     clean = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
@@ -231,11 +307,70 @@ def projection_bands(binary: np.ndarray, env: dict[str, str]) -> list[tuple[int,
     if in_band and height - start >= min_band_height:
         bands.append((start, height - 1, float(projection[start:].mean())))
 
-    expected = max(1, env_int(env, "READMRZ_OCR_LINE2_EXPECTED_LINES", 2))
     bands = split_wide_bands_by_valleys(projection, bands, expected, min_band_height)
     bands = force_expected_bands_from_projection(projection, bands, expected, min_band_height)
     bands = sorted(bands, key=lambda item: item[2] * (item[1] - item[0]), reverse=True)[:expected]
     return sorted(bands, key=lambda item: item[0])
+
+
+def connected_component_line_bands(binary: np.ndarray, expected: int) -> list[tuple[int, int, float]]:
+    if expected <= 0:
+        return []
+
+    count, _, stats, centroids = cv2.connectedComponentsWithStats(binary, 8)
+    components: list[dict[str, float]] = []
+    image_height, image_width = binary.shape[:2]
+    for index in range(1, count):
+        x, y, width, height, area = stats[index]
+        if not (2 <= width <= min(70, image_width) and 6 <= height <= min(70, image_height) and area >= 8):
+            continue
+        components.append(
+            {
+                "x1": float(x),
+                "y1": float(y),
+                "x2": float(x + width),
+                "y2": float(y + height),
+                "height": float(height),
+                "area": float(area),
+                "cy": float(centroids[index][1]),
+            }
+        )
+
+    if len(components) < expected * 5:
+        return []
+
+    median_height = float(np.median([component["height"] for component in components]))
+    y_threshold = max(10.0, median_height * 1.4)
+    groups: list[dict[str, Any]] = []
+    for component in sorted(components, key=lambda item: item["cy"]):
+        if not groups or abs(component["cy"] - float(groups[-1]["cy_mean"])) > y_threshold:
+            groups.append({"items": [component], "cy_mean": component["cy"]})
+            continue
+        group = groups[-1]
+        group["items"].append(component)
+        group["cy_mean"] = float(np.mean([item["cy"] for item in group["items"]]))
+
+    candidates: list[tuple[float, int, int, float]] = []
+    for group in groups:
+        items = group["items"]
+        if len(items) < 3:
+            continue
+        x1 = min(item["x1"] for item in items)
+        x2 = max(item["x2"] for item in items)
+        y1 = int(max(0, round(min(item["y1"] for item in items))))
+        y2 = int(min(image_height - 1, round(max(item["y2"] for item in items))))
+        span = x2 - x1
+        if span < image_width * 0.20:
+            continue
+        area = sum(item["area"] for item in items)
+        score = float(span * len(items) + area)
+        candidates.append((score, y1, y2, score / max(1, y2 - y1)))
+
+    if len(candidates) < expected:
+        return []
+
+    selected = sorted(candidates, key=lambda item: item[0], reverse=True)[:expected]
+    return sorted([(y1, y2, score) for _, y1, y2, score in selected], key=lambda item: item[0])
 
 
 def split_wide_bands_by_valleys(
@@ -329,17 +464,72 @@ def crop_line_images(
         image = deskewed_crop[top:bottom, :].copy()
         if image.size == 0:
             continue
+        left = 0
+        right = width
+        if env_value(env, "READMRZ_OCR_LINE2_TRIM_X", "true").strip().lower() in {"1", "true", "yes", "on"}:
+            left, right = trim_line_x_bounds(image, width, env)
+            image = image[:, left:right].copy()
         line_height, line_width = image.shape[:2]
         lines.append(
             {
                 "image": image,
                 "width": line_width,
                 "height": line_height,
-                "bbox_crop": [0.0, float(top), float(width - 1), float(bottom)],
+                "bbox_crop": [float(left), float(top), float(right), float(bottom)],
                 "projection_score": score,
             }
         )
     return lines
+
+
+def trim_line_x_bounds(line_image: np.ndarray, fallback_width: int, env: dict[str, str]) -> tuple[int, int]:
+    binary = binarize_for_text(line_image)
+    component_bounds = trim_line_x_bounds_from_components(binary, fallback_width, env)
+    if component_bounds is not None:
+        return component_bounds
+
+    projection = binary.sum(axis=0).astype(np.float32)
+    if projection.max() <= 0:
+        return 0, fallback_width
+
+    threshold = max(255.0, projection.max() * env_float(env, "READMRZ_OCR_LINE2_TRIM_X_THRESHOLD_RATIO", 0.08))
+    active = np.where(projection >= threshold)[0]
+    if active.size == 0:
+        return 0, fallback_width
+
+    pad = max(6, int(round(fallback_width * env_float(env, "READMRZ_OCR_LINE2_TRIM_X_PADDING_RATIO", 0.02))))
+    left = max(0, int(active.min()) - pad)
+    right = min(fallback_width, int(active.max()) + pad + 1)
+    if right - left < fallback_width * 0.25:
+        return 0, fallback_width
+    return left, right
+
+
+def trim_line_x_bounds_from_components(
+    binary: np.ndarray,
+    fallback_width: int,
+    env: dict[str, str],
+) -> tuple[int, int] | None:
+    count, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    boxes: list[tuple[int, int, int]] = []
+    image_height, image_width = binary.shape[:2]
+    for index in range(1, count):
+        x, _, width, height, area = stats[index]
+        if not (2 <= width <= min(70, image_width) and 6 <= height <= min(70, image_height) and area >= 8):
+            continue
+        boxes.append((int(x), int(x + width), int(area)))
+
+    if len(boxes) < 8:
+        return None
+
+    left = min(box[0] for box in boxes)
+    right = max(box[1] for box in boxes)
+    pad = max(6, int(round(fallback_width * env_float(env, "READMRZ_OCR_LINE2_TRIM_X_PADDING_RATIO", 0.02))))
+    left = max(0, left - pad)
+    right = min(fallback_width, right + pad)
+    if right - left < fallback_width * 0.25:
+        return None
+    return left, right
 
 
 def paddle_ocr_line(ocr: Any, line_image: np.ndarray, temp_dir: Path, stem: str) -> tuple[str, float]:
@@ -383,6 +573,7 @@ def write_line_row2(
     deskew_angle: float,
     ocr_text: str,
     ocr_score: float,
+    error_message: str | None = None,
 ) -> None:
     normalized = normalize_mrz_text(ocr_text)
     likeness = line_mrz_likeness(ocr_text) if ocr_text else 0.0
@@ -406,6 +597,7 @@ def write_line_row2(
             line_bbox_y1,
             line_bbox_x2,
             line_bbox_y2,
+            doc_orientation_angle,
             deskew_angle,
             projection_score,
             split_method,
@@ -414,9 +606,12 @@ def write_line_row2(
             final_text,
             ocr_score,
             mrz_likeness,
-            review_status
+            review_status,
+            error_message,
+            created_at,
+            updated_at
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencv_projection', ?, ?, ?, ?, ?, 'pending')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'opencv_projection', ?, ?, ?, ?, ?, 'pending', ?, SYSUTCDATETIME(), SYSUTCDATETIME())
         """,
         item["id"],
         item["source_key"],
@@ -434,6 +629,7 @@ def write_line_row2(
         line_bbox[1],
         line_bbox[2],
         line_bbox[3],
+        0,
         deskew_angle,
         float(line.get("projection_score") or 0.0),
         ocr_text,
@@ -441,6 +637,7 @@ def write_line_row2(
         normalized or None,
         ocr_score,
         likeness,
+        error_message,
     )
 
 
@@ -462,6 +659,31 @@ def mark_parent2(cursor: Any, item_id: int, *, status: str, count: int = 0, erro
     )
 
 
+def count_line2_rows(cursor: Any, label_item_id: int) -> int:
+    cursor.execute("SELECT COUNT(*) FROM dbo.readmrz_ocr_line_items2 WHERE label_item_id = ?", label_item_id)
+    row = cursor.fetchone()
+    return int(row[0] or 0) if row else 0
+
+
+def parent_mrz_lines(item: dict[str, Any]) -> list[str]:
+    raw = item.get("mrz_lines_json")
+    if not raw:
+        return []
+    if isinstance(raw, list):
+        values = raw
+    else:
+        try:
+            values = json.loads(str(raw))
+        except json.JSONDecodeError:
+            return []
+    lines: list[str] = []
+    for value in values:
+        text = normalize_mrz_text(str(value or ""))
+        if text:
+            lines.append(text)
+    return lines
+
+
 def process_item(
     cursor: Any,
     *,
@@ -469,7 +691,9 @@ def process_item(
     image_base_dir: Path,
     line_image_base_dir: Path,
     crop_base_dir: Path,
-    ocr: Any,
+    raw_crop_base_dir: Path,
+    ocr: Any | None,
+    text_source: str,
     env: dict[str, str],
     temp_dir: Path,
 ) -> tuple[int, int, float]:
@@ -500,19 +724,56 @@ def process_item(
     split = str(item.get("split") or "train")
     line_output_dir = line_image_base_dir / split
     crop_output_dir = crop_base_dir / split
+    raw_crop_output_dir = raw_crop_base_dir / split
     line_output_dir.mkdir(parents=True, exist_ok=True)
     crop_output_dir.mkdir(parents=True, exist_ok=True)
+    raw_crop_output_dir.mkdir(parents=True, exist_ok=True)
 
     stem = Path(str(item["image_file_name"])).stem
+    raw_crop_path = raw_crop_output_dir / f"{stem}_mrz_raw_crop.jpg"
+    cv2.imwrite(str(raw_crop_path), crop)
     crop_path = crop_output_dir / f"{stem}_mrz_crop.jpg"
     cv2.imwrite(str(crop_path), deskewed_crop)
     crop_rel = relative_to_base(crop_path, crop_base_dir)
 
     line_count = 0
+    source_lines = parent_mrz_lines(item) if text_source == "parent" else []
+    crop_ocr_error: str | None = None
+    crop_ocr_rows: list[dict[str, Any]] = []
+    if text_source == "paddle-crop" and ocr is not None:
+        try:
+            crop_rows = ocr_rows_for_crop(ocr, deskewed_crop, temp_dir, int(item["id"]))
+            crop_ocr_rows = select_mrz_line_rows(crop_rows, env, deskewed_crop)
+        except Exception as exc:
+            crop_ocr_error = str(exc)[:1900]
+
     for line_index, line in enumerate(lines, start=1):
         line_path = line_output_dir / f"{stem}_line{line_index}.jpg"
         cv2.imwrite(str(line_path), line["image"])
-        ocr_text, ocr_score = paddle_ocr_line(ocr, line["image"], temp_dir, f"{stem}_line{line_index}")
+        ocr_text = ""
+        ocr_score = 0.0
+        ocr_error: str | None = None
+        if text_source == "paddle-crop":
+            if line_index <= len(crop_ocr_rows):
+                row = crop_ocr_rows[line_index - 1]
+                ocr_text = str(row.get("normalized") or row.get("text") or "")
+                ocr_score = float(row.get("ocr_score") or 0.0)
+                ocr_error = "text_from_paddle_mrz_crop"
+            else:
+                ocr_error = crop_ocr_error or "paddle_crop_text_missing"
+        elif text_source == "parent":
+            if line_index <= len(source_lines):
+                ocr_text = source_lines[line_index - 1]
+                ocr_error = "text_from_parent_mrz_lines_json"
+            else:
+                ocr_error = "parent_text_missing"
+        elif text_source == "none":
+            ocr_error = "ocr_skipped"
+        elif text_source == "paddle-line" and ocr is not None:
+            try:
+                ocr_text, ocr_score = paddle_ocr_line(ocr, line["image"], temp_dir, f"{stem}_line{line_index}")
+            except Exception as exc:
+                ocr_error = str(exc)[:1900]
         write_line_row2(
             cursor,
             item=item,
@@ -524,6 +785,7 @@ def process_item(
             deskew_angle=deskew_angle,
             ocr_text=ocr_text,
             ocr_score=ocr_score,
+            error_message=ocr_error,
         )
         line_count += 1
 
@@ -537,6 +799,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--force", action="store_true", help="Regenerate line2 records even when parent is already done.")
     parser.add_argument("--include-augmented", action="store_true", help="Also process records whose source_key ends with __rot90/__rot180/__rot270.")
     parser.add_argument("--split", choices=["train", "val"], default="", help="Optional YOLO split filter.")
+    parser.add_argument("--skip-ocr", action="store_true", help="Only crop/split MRZ lines and insert DB rows with blank OCR text.")
+    parser.add_argument(
+        "--text-source",
+        choices=["paddle", "paddle-crop", "paddle-line", "parent", "none"],
+        default="",
+        help="Text source for line labels. Default READMRZ_OCR_LINE2_TEXT_SOURCE or paddle-crop.",
+    )
     return parser
 
 
@@ -549,9 +818,16 @@ def main() -> int:
         env_path = cwd_env_path if cwd_env_path.exists() else project_env_path
 
     env = read_env_file(env_path)
-    reexec_code = maybe_reexec_with_paddle_python(env)
-    if reexec_code is not None:
-        return reexec_code
+    text_source = "none" if args.skip_ocr else (args.text_source or env_value(env, "READMRZ_OCR_LINE2_TEXT_SOURCE", "paddle-crop")).strip().lower()
+    if text_source == "paddle":
+        text_source = "paddle-crop"
+    if text_source not in {"paddle-crop", "paddle-line", "parent", "none"}:
+        raise ValueError(f"Invalid text source: {text_source}")
+
+    if text_source in {"paddle-crop", "paddle-line"}:
+        reexec_code = maybe_reexec_with_paddle_python(env)
+        if reexec_code is not None:
+            return reexec_code
 
     ensure_line2_schema()
 
@@ -560,6 +836,7 @@ def main() -> int:
     line2_dataset_dir = resolve_base_dir(env, "READMRZ_OCR_LINE2_DATASET_DIR", PROJECT_ROOT / "generated_datasets" / "mrz_ocr_lines2")
     line2_image_base_dir = resolve_base_dir(env, "READMRZ_OCR_LINE2_IMAGE_BASE_DIR", line2_dataset_dir / "images")
     line2_crop_base_dir = resolve_base_dir(env, "READMRZ_OCR_LINE2_CROP_BASE_DIR", line2_dataset_dir / "crops")
+    line2_raw_crop_base_dir = resolve_base_dir(env, "READMRZ_OCR_LINE2_RAW_CROP_BASE_DIR", line2_dataset_dir / "raw_crops")
     batch_size = max(1, env_int(env, "READMRZ_OCR_LINE2_BATCH_SIZE", 25))
 
     print(f"dataset_dir: {dataset_dir}")
@@ -567,12 +844,20 @@ def main() -> int:
     print(f"line2_dataset_dir: {line2_dataset_dir}")
     print(f"line2_image_base_dir: {line2_image_base_dir}")
     print(f"line2_crop_base_dir: {line2_crop_base_dir}")
+    print(f"line2_raw_crop_base_dir: {line2_raw_crop_base_dir}")
     print(f"limit: {args.limit}")
     print(f"force: {args.force}")
     print(f"include_augmented: {args.include_augmented}")
     print(f"split: {args.split or 'all'}")
+    print(f"skip_ocr: {args.skip_ocr}")
+    print(f"text_source: {text_source}")
 
-    ocr = build_ocr(env)
+    if text_source == "paddle-crop":
+        ocr = build_ocr(env)
+    elif text_source == "paddle-line":
+        ocr = build_ocr(line2_ocr_env(env))
+    else:
+        ocr = None
     total = 0
     done = 0
     no_lines = 0
@@ -597,6 +882,7 @@ def main() -> int:
                 line_count = 0
                 band_count = 0
                 deskew_angle = 0.0
+                db_rows = 0
                 try:
                     line_count, band_count, deskew_angle = process_item(
                         cursor,
@@ -604,7 +890,9 @@ def main() -> int:
                         image_base_dir=image_base_dir,
                         line_image_base_dir=line2_image_base_dir,
                         crop_base_dir=line2_crop_base_dir,
+                        raw_crop_base_dir=line2_raw_crop_base_dir,
                         ocr=ocr,
+                        text_source=text_source,
                         env=env,
                         temp_dir=temp_dir,
                     )
@@ -625,12 +913,16 @@ def main() -> int:
                         error_text = f"{error_text}; mark_parent_failed={mark_exc}"
                     errors += 1
 
+                try:
+                    db_rows = count_line2_rows(cursor, int(item["id"]))
+                except Exception:
+                    db_rows = -1
                 if index % batch_size == 0:
                     connection.commit()
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 print(
                     f"[{index}/{total}] source={item['source_key']} "
-                    f"status={status} lines={line_count} bands={band_count} "
+                    f"status={status} lines={line_count} db_rows={db_rows} bands={band_count} "
                     f"angle={deskew_angle:.2f} elapsed_ms={elapsed_ms}"
                     + (f" error={error_text}" if status == "error" else "")
                 )
@@ -644,6 +936,7 @@ def main() -> int:
         "line2_dataset_dir": str(line2_dataset_dir),
         "line2_image_base_dir": str(line2_image_base_dir),
         "line2_crop_base_dir": str(line2_crop_base_dir),
+        "line2_raw_crop_base_dir": str(line2_raw_crop_base_dir),
     }
     print(json.dumps(summary, ensure_ascii=False, indent=2))
     return 0

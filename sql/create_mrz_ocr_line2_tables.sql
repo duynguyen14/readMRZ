@@ -59,6 +59,127 @@ BEGIN
     );
 END;
 
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'mrz_crop_file_name') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD mrz_crop_file_name NVARCHAR(700) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'line_image_width') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD line_image_width INT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'line_image_height') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD line_image_height INT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'mrz_bbox_x1') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD mrz_bbox_x1 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'mrz_bbox_y1') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD mrz_bbox_y1 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'mrz_bbox_x2') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD mrz_bbox_x2 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'mrz_bbox_y2') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD mrz_bbox_y2 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'line_bbox_x1') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD line_bbox_x1 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'line_bbox_y1') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD line_bbox_y1 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'line_bbox_x2') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD line_bbox_x2 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'line_bbox_y2') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD line_bbox_y2 FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'doc_orientation_angle') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2
+    ADD doc_orientation_angle INT NOT NULL CONSTRAINT DF_readmrz_ocr_line_items2_doc_orientation_angle DEFAULT (0);
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'deskew_angle') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD deskew_angle FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'projection_score') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD projection_score FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'split_method') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD split_method VARCHAR(64) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'ocr_text') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD ocr_text NVARCHAR(160) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'normalized_text') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD normalized_text NVARCHAR(160) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'final_text') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD final_text NVARCHAR(160) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'ocr_score') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD ocr_score FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'mrz_likeness') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD mrz_likeness FLOAT NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'error_message') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD error_message NVARCHAR(2000) NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'created_at') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD created_at DATETIME2 NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'reviewed_at') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD reviewed_at DATETIME2 NULL;
+END;
+
+IF COL_LENGTH(N'dbo.readmrz_ocr_line_items2', N'updated_at') IS NULL
+BEGIN
+    ALTER TABLE dbo.readmrz_ocr_line_items2 ADD updated_at DATETIME2 NULL;
+END;
+
 IF NOT EXISTS (
     SELECT 1 FROM sys.indexes
     WHERE name = N'IX_readmrz_ocr_line_items2_review_queue'
