@@ -239,6 +239,8 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                         "YOLO_MRZ_DETECT done "
                         f"input={input_name} found={payload['found']} "
                         f"boxes={len(payload['boxes'])} detector_ms={payload['detector_ms']} "
+                        f"fallback_used={payload.get('fallback_used')} "
+                        f"rotation={payload.get('selected_rotation_angle')} "
                         f"latency_ms={payload['latency_ms']}"
                     )
                     self.send_json(200, payload)
