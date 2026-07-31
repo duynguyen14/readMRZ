@@ -225,7 +225,7 @@ def estimate_skew_angle_hough(binary: np.ndarray, max_angle: float) -> float | N
         return None
 
     angles: list[float] = []
-    for x1, y1, x2, y2 in lines[:, 0]:
+    for x1, y1, x2, y2 in lines.reshape(-1, 4):
         if abs(int(x2) - int(x1)) < 30:
             continue
         angle = float(np.degrees(np.arctan2(int(y2) - int(y1), int(x2) - int(x1))))
