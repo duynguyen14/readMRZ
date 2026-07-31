@@ -20,6 +20,7 @@ from .ocr_line_review import (
     get_previous_ocr_line_review_item,
     submit_ocr_line_review_decision,
 )
+from .yolo_detector import YoloMrzDetector
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "readmrz-api.log"
@@ -104,6 +105,7 @@ def decode_request_image(data: bytes, content_type: str):
 
 def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     engine: MrzOcrEngine | None = None
+    yolo_detector: YoloMrzDetector | None = None
 
     def get_engine() -> MrzOcrEngine:
         nonlocal engine
@@ -111,6 +113,14 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             log_api("Loading MRZ OCR engine")
             engine = MrzOcrEngine()
         return engine
+
+    def get_yolo_detector() -> YoloMrzDetector:
+        nonlocal yolo_detector
+        if yolo_detector is None:
+            log_api("Loading MRZ YOLO detector")
+            yolo_detector = YoloMrzDetector()
+            log_api(f"Loaded MRZ YOLO detector model_load_ms={yolo_detector.load_ms}")
+        return yolo_detector
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
@@ -213,6 +223,28 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 except Exception as exc:
                     log_api(f"OCR_LINE_REVIEW error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/yolo-mrz-detect":
+                try:
+                    request_started = time.perf_counter()
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    content_type = self.headers.get("Content-Type", "")
+                    image, input_name = decode_request_image(data, content_type)
+                    payload = get_yolo_detector().detect(image)
+                    payload["input"] = input_name
+                    payload["latency_ms"] = int((time.perf_counter() - request_started) * 1000)
+                    log_api(
+                        "YOLO_MRZ_DETECT done "
+                        f"input={input_name} found={payload['found']} "
+                        f"boxes={len(payload['boxes'])} detector_ms={payload['detector_ms']} "
+                        f"latency_ms={payload['latency_ms']}"
+                    )
+                    self.send_json(200, payload)
+                except Exception as exc:
+                    log_api(f"YOLO_MRZ_DETECT error {exc}")
+                    self.send_json(400, {"found": False, "boxes": [], "best_box": None, "error": str(exc)})
                 return
 
             if parsed_url.path != "/read":

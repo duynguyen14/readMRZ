@@ -6,3 +6,4 @@ paddlepaddle
 paddleocr
 paddlex
 pyodbc
+ultralytics

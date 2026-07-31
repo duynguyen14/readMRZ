@@ -214,6 +214,7 @@ def projection_bands(binary: np.ndarray, env: dict[str, str]) -> list[tuple[int,
 
     expected = max(1, env_int(env, "READMRZ_OCR_LINE2_EXPECTED_LINES", 2))
     bands = split_wide_bands_by_valleys(projection, bands, expected, min_band_height)
+    bands = force_expected_bands_from_projection(projection, bands, expected, min_band_height)
     bands = sorted(bands, key=lambda item: item[2] * (item[1] - item[0]), reverse=True)[:expected]
     return sorted(bands, key=lambda item: item[0])
 
@@ -267,13 +268,41 @@ def find_best_valley(projection: np.ndarray, y1: int, y2: int, min_band_height: 
     return int(start + int(np.argmin(window)))
 
 
+def force_expected_bands_from_projection(
+    projection: np.ndarray,
+    bands: list[tuple[int, int, float]],
+    expected: int,
+    min_band_height: int,
+) -> list[tuple[int, int, float]]:
+    if expected <= 1 or len(bands) >= expected:
+        return bands
+
+    active = np.where(projection > max(1.0, projection.max() * 0.03))[0]
+    if active.size == 0:
+        return bands
+
+    top = int(active.min())
+    bottom = int(active.max()) + 1
+    if bottom - top < min_band_height * expected:
+        return bands
+
+    band_height = max(min_band_height, int(round((bottom - top) / expected)))
+    forced: list[tuple[int, int, float]] = []
+    for index in range(expected):
+        y1 = top + index * band_height
+        y2 = bottom if index == expected - 1 else min(bottom, y1 + band_height)
+        if y2 - y1 >= min_band_height:
+            forced.append((y1, y2, float(projection[y1:y2].mean())))
+    return forced if len(forced) >= expected else bands
+
+
 def crop_line_images(
     deskewed_crop: np.ndarray,
     bands: list[tuple[int, int, float]],
     env: dict[str, str],
 ) -> list[dict[str, Any]]:
     height, width = deskewed_crop.shape[:2]
-    pad_y = max(2, int(round(height * env_float(env, "READMRZ_OCR_LINE2_LINE_PADDING_RATIO", 0.12))))
+    pad_y = max(2, int(round(height * env_float(env, "READMRZ_OCR_LINE2_LINE_PADDING_RATIO", 0.06))))
     lines: list[dict[str, Any]] = []
     for y1, y2, score in bands:
         top = max(0, y1 - pad_y)
@@ -424,7 +453,7 @@ def process_item(
     ocr: Any,
     env: dict[str, str],
     temp_dir: Path,
-) -> int:
+) -> tuple[int, int, float]:
     image_path = image_base_dir / str(item["image_file_name"])
     image = cv2.imread(str(image_path))
     if image is None:
@@ -446,7 +475,7 @@ def process_item(
     bands = projection_bands(binary, env)
     lines = crop_line_images(deskewed_crop, bands, env)
     if not lines:
-        return 0
+        return 0, len(bands), deskew_angle
 
     cursor.execute("DELETE FROM dbo.readmrz_ocr_line_items2 WHERE label_item_id = ?", item["id"])
     split = str(item.get("split") or "train")
@@ -479,7 +508,7 @@ def process_item(
         )
         line_count += 1
 
-    return line_count
+    return line_count, len(bands), deskew_angle
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -527,8 +556,10 @@ def main() -> int:
                 started = time.perf_counter()
                 status = "error"
                 line_count = 0
+                band_count = 0
+                deskew_angle = 0.0
                 try:
-                    line_count = process_item(
+                    line_count, band_count, deskew_angle = process_item(
                         cursor,
                         item=item,
                         image_base_dir=image_base_dir,
@@ -556,7 +587,8 @@ def main() -> int:
                 elapsed_ms = int((time.perf_counter() - started) * 1000)
                 print(
                     f"[{index}/{total}] source={item['source_key']} "
-                    f"status={status} lines={line_count} elapsed_ms={elapsed_ms}"
+                    f"status={status} lines={line_count} bands={band_count} "
+                    f"angle={deskew_angle:.2f} elapsed_ms={elapsed_ms}"
                 )
             connection.commit()
 
