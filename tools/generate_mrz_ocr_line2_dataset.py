@@ -458,9 +458,22 @@ def crop_line_images(
     height, width = deskewed_crop.shape[:2]
     pad_y = max(2, int(round(height * env_float(env, "READMRZ_OCR_LINE2_LINE_PADDING_RATIO", 0.06))))
     lines: list[dict[str, Any]] = []
-    for y1, y2, score in bands:
-        top = max(0, y1 - pad_y)
-        bottom = min(height, y2 + pad_y)
+    sorted_bands = sorted(bands, key=lambda item: item[0])
+    for index, (y1, y2, score) in enumerate(sorted_bands):
+        min_top = 0
+        max_bottom = height
+        if index > 0:
+            prev_y2 = sorted_bands[index - 1][1]
+            min_top = max(0, int(round((prev_y2 + y1) / 2.0)))
+        if index < len(sorted_bands) - 1:
+            next_y1 = sorted_bands[index + 1][0]
+            max_bottom = min(height, int(round((y2 + next_y1) / 2.0)))
+
+        top = max(min_top, y1 - pad_y)
+        bottom = min(max_bottom, y2 + pad_y)
+        if bottom <= top:
+            top = max(0, y1)
+            bottom = min(height, max(y2, y1 + 1))
         image = deskewed_crop[top:bottom, :].copy()
         if image.size == 0:
             continue
