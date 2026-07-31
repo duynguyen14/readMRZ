@@ -126,6 +126,10 @@ def resolve_under_base(base_dir: Path, value: str) -> Path:
     return path if path.is_absolute() else base_dir / path
 
 
+def resolve_dataset_child_dir(dataset_dir: Path, child_name: str) -> Path:
+    return (dataset_dir / child_name).expanduser().resolve()
+
+
 def split_relative_path(split: str, file_name: str, suffix: str) -> str:
     path = Path(file_name)
     stem = path.stem
@@ -406,8 +410,8 @@ def main() -> int:
     args = parse_args()
     env = read_env_file()
     dataset_dir = yolo_dataset_dir(env)
-    image_base_dir = Path(env_value(env, "READMRZ_YOLO_IMAGE_BASE_DIR", str(dataset_dir / "images"))).expanduser().resolve()
-    label_base_dir = Path(env_value(env, "READMRZ_YOLO_LABEL_BASE_DIR", str(dataset_dir / "labels"))).expanduser().resolve()
+    image_base_dir = resolve_dataset_child_dir(dataset_dir, "images")
+    label_base_dir = resolve_dataset_child_dir(dataset_dir, "labels")
     seed = args.seed if args.seed is not None else int_env(env, "READMRZ_YOLO_AUG_SEED", 20260731)
     include_augmented = bool_env(env, "READMRZ_YOLO_AUG_INCLUDE_AUGMENTED", False)
     batch_size = max(1, int_env(env, "READMRZ_YOLO_AUG_DB_BATCH_SIZE", 250))
