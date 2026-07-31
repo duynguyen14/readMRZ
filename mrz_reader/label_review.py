@@ -19,8 +19,8 @@ def review_paths() -> dict[str, Path]:
     return {
         "source_base_dir": Path(env_value(env, "READMRZ_SOURCE_IMAGE_DIR", str(Path.cwd()))).expanduser().resolve(),
         "dataset_dir": dataset_dir,
-        "image_base_dir": Path(env_value(env, "READMRZ_YOLO_IMAGE_BASE_DIR", str(dataset_dir / "images"))).expanduser().resolve(),
-        "label_base_dir": Path(env_value(env, "READMRZ_YOLO_LABEL_BASE_DIR", str(dataset_dir / "labels"))).expanduser().resolve(),
+        "image_base_dir": (dataset_dir / "images").expanduser().resolve(),
+        "label_base_dir": (dataset_dir / "labels").expanduser().resolve(),
     }
 
 
@@ -124,10 +124,10 @@ def after_id(cursor: Any, after_key: str) -> int:
     return int(row[0]) if row else 0
 
 
-def pending_candidates(cursor: Any, min_id: int) -> list[dict[str, Any]]:
+def pending_candidates(cursor: Any, min_id: int, limit: int = 500) -> list[dict[str, Any]]:
     cursor.execute(
         """
-        SELECT TOP 50 *
+        SELECT TOP (?) *
         FROM dbo.readmrz_label_items
         WHERE id > ?
           AND status = 'labeled'
@@ -136,6 +136,7 @@ def pending_candidates(cursor: Any, min_id: int) -> list[dict[str, Any]]:
           AND label_file_name IS NOT NULL
         ORDER BY id ASC
         """,
+        limit,
         min_id,
     )
     return [row_to_dict(cursor, row) for row in cursor.fetchall()]
@@ -149,16 +150,22 @@ def row_artifacts_exist(row: dict[str, Any], paths: dict[str, Path]) -> bool:
 def next_pending_row(cursor: Any, after_key: str, paths: dict[str, Path]) -> dict[str, Any] | None:
     start_id = after_id(cursor, after_key)
     for min_id in (start_id, 0):
-        for row in pending_candidates(cursor, min_id):
-            if row_artifacts_exist(row, paths):
-                return row
+        cursor_id = min_id
+        while True:
+            rows = pending_candidates(cursor, cursor_id)
+            if not rows:
+                break
+            for row in rows:
+                cursor_id = int(row["id"])
+                if row_artifacts_exist(row, paths):
+                    return row
     return None
 
 
-def previous_candidates(cursor: Any, max_id: int) -> list[dict[str, Any]]:
+def previous_candidates(cursor: Any, max_id: int, limit: int = 500) -> list[dict[str, Any]]:
     cursor.execute(
         """
-        SELECT TOP 50 *
+        SELECT TOP (?) *
         FROM dbo.readmrz_label_items
         WHERE id < ?
           AND status = 'labeled'
@@ -166,6 +173,7 @@ def previous_candidates(cursor: Any, max_id: int) -> list[dict[str, Any]]:
           AND label_file_name IS NOT NULL
         ORDER BY id DESC
         """,
+        limit,
         max_id,
     )
     return [row_to_dict(cursor, row) for row in cursor.fetchall()]
@@ -177,9 +185,15 @@ def previous_review_row(cursor: Any, before_key: str, paths: dict[str, Path]) ->
         cursor.execute("SELECT ISNULL(MAX(id) + 1, 0) FROM dbo.readmrz_label_items WHERE status = 'labeled'")
         row = cursor.fetchone()
         start_id = int(row[0] or 0) if row else 0
-    for row in previous_candidates(cursor, start_id):
-        if row_artifacts_exist(row, paths):
-            return row
+    cursor_id = start_id
+    while True:
+        rows = previous_candidates(cursor, cursor_id)
+        if not rows:
+            break
+        for row in rows:
+            cursor_id = int(row["id"])
+            if row_artifacts_exist(row, paths):
+                return row
     return None
 
 
