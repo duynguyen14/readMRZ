@@ -161,11 +161,11 @@ def format_yolo_label(values: tuple[int, float, float, float, float]) -> str:
 def rotate_yolo_label(label_text: str, rotation_angle: int) -> str:
     class_id, x_center, y_center, width, height = parse_yolo_label(label_text)
     if rotation_angle == 90:
-        return format_yolo_label((class_id, 1.0 - y_center, x_center, height, width))
+        return format_yolo_label((class_id, y_center, 1.0 - x_center, height, width))
     if rotation_angle == 180:
         return format_yolo_label((class_id, 1.0 - x_center, 1.0 - y_center, width, height))
     if rotation_angle == 270:
-        return format_yolo_label((class_id, y_center, 1.0 - x_center, height, width))
+        return format_yolo_label((class_id, 1.0 - y_center, x_center, height, width))
     raise ValueError(f"Unsupported rotation angle: {rotation_angle}")
 
 
