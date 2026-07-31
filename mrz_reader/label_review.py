@@ -437,6 +437,39 @@ def submit_review_decision(key: str, decision: str) -> dict[str, Any]:
     }
 
 
+def approve_pending_rotation(rotation_angle: int) -> dict[str, Any]:
+    if rotation_angle not in {90, 180, 270}:
+        raise ValueError("rotation_angle must be one of 90, 180, 270")
+
+    suffix = f"__rot{rotation_angle}"
+    with connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute(
+            """
+            UPDATE dbo.readmrz_label_items
+            SET review_status = 'approved',
+                reviewed_at = SYSUTCDATETIME(),
+                updated_at = SYSUTCDATETIME()
+            WHERE status = 'labeled'
+              AND review_status = 'pending'
+              AND source_key LIKE ?
+            """,
+            f"%{suffix}",
+        )
+        updated = int(cursor.rowcount or 0)
+        stats = review_stats(cursor)
+        connection.commit()
+
+    next_response = get_next_review_item("")
+    return {
+        "status": "ok",
+        "rotation_angle": rotation_angle,
+        "updated": updated,
+        "next": next_response.get("current"),
+        "stats": next_response.get("stats", stats),
+    }
+
+
 def correct_review_box(key: str, bbox_xyxy: list[Any]) -> dict[str, Any]:
     paths = review_paths()
     with connect() as connection:
