@@ -459,18 +459,19 @@ def crop_line_images(
     pad_y = max(2, int(round(height * env_float(env, "READMRZ_OCR_LINE2_LINE_PADDING_RATIO", 0.06))))
     lines: list[dict[str, Any]] = []
     sorted_bands = sorted(bands, key=lambda item: item[0])
+    binary = binarize_for_text(deskewed_crop)
+    projection = binary.sum(axis=1).astype(np.float32)
+    separators = line_separators_from_projection(projection, sorted_bands)
     for index, (y1, y2, score) in enumerate(sorted_bands):
-        min_top = 0
-        max_bottom = height
-        if index > 0:
-            prev_y2 = sorted_bands[index - 1][1]
-            min_top = max(0, int(round((prev_y2 + y1) / 2.0)))
-        if index < len(sorted_bands) - 1:
-            next_y1 = sorted_bands[index + 1][0]
-            max_bottom = min(height, int(round((y2 + next_y1) / 2.0)))
-
-        top = max(min_top, y1 - pad_y)
-        bottom = min(max_bottom, y2 + pad_y)
+        min_top = separators[index - 1] if index > 0 else 0
+        max_bottom = separators[index] if index < len(separators) else height
+        top, bottom = active_bounds_in_segment(
+            projection,
+            min_top,
+            max_bottom,
+            pad_y,
+            env_float(env, "READMRZ_OCR_LINE2_LINE_ACTIVE_THRESHOLD_RATIO", 0.05),
+        )
         if bottom <= top:
             top = max(0, y1)
             bottom = min(height, max(y2, y1 + 1))
@@ -493,6 +494,54 @@ def crop_line_images(
             }
         )
     return lines
+
+
+def line_separators_from_projection(
+    projection: np.ndarray,
+    bands: list[tuple[int, int, float]],
+) -> list[int]:
+    separators: list[int] = []
+    if len(bands) < 2:
+        return separators
+
+    height = len(projection)
+    for left_band, right_band in zip(bands, bands[1:], strict=False):
+        left_center = int(round((left_band[0] + left_band[1]) / 2.0))
+        right_center = int(round((right_band[0] + right_band[1]) / 2.0))
+        start = max(0, min(left_center, right_center))
+        end = min(height, max(left_center, right_center) + 1)
+        if end - start <= 1:
+            separators.append(max(0, min(height, int(round((left_band[1] + right_band[0]) / 2.0)))))
+            continue
+        window = projection[start:end]
+        separators.append(start + int(np.argmin(window)))
+    return separators
+
+
+def active_bounds_in_segment(
+    projection: np.ndarray,
+    segment_top: int,
+    segment_bottom: int,
+    pad_y: int,
+    threshold_ratio: float,
+) -> tuple[int, int]:
+    height = len(projection)
+    segment_top = max(0, min(height, int(segment_top)))
+    segment_bottom = max(segment_top + 1, min(height, int(segment_bottom)))
+    segment = projection[segment_top:segment_bottom]
+    if segment.size == 0 or segment.max() <= 0:
+        return segment_top, segment_bottom
+
+    threshold = max(1.0, float(segment.max()) * threshold_ratio)
+    active = np.where(segment >= threshold)[0]
+    if active.size == 0:
+        return segment_top, segment_bottom
+
+    top = max(segment_top, segment_top + int(active.min()) - pad_y)
+    bottom = min(segment_bottom, segment_top + int(active.max()) + pad_y + 1)
+    if bottom <= top:
+        return segment_top, segment_bottom
+    return top, bottom
 
 
 def trim_line_x_bounds(line_image: np.ndarray, fallback_width: int, env: dict[str, str]) -> tuple[int, int]:

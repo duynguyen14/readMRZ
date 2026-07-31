@@ -26,6 +26,11 @@ from .ocr_line_review import (
     get_previous_ocr_line_review_item,
     submit_ocr_line_review_decision,
 )
+from .ocr_line2_review import (
+    get_next_ocr_line2_review_item,
+    get_previous_ocr_line2_review_item,
+    submit_ocr_line2_review_decision,
+)
 from .yolo_detector import YoloMrzDetector
 
 
@@ -177,6 +182,16 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 before_id = int(params.get("before_id", ["0"])[0] or "0")
                 self.send_json(200, get_previous_ocr_line_review_item(before_id))
                 return
+            if parsed_url.path == "/ocr-line2-review/next":
+                params = parse_qs(parsed_url.query)
+                after_id = int(params.get("after_id", ["0"])[0] or "0")
+                self.send_json(200, get_next_ocr_line2_review_item(after_id))
+                return
+            if parsed_url.path == "/ocr-line2-review/previous":
+                params = parse_qs(parsed_url.query)
+                before_id = int(params.get("before_id", ["0"])[0] or "0")
+                self.send_json(200, get_previous_ocr_line2_review_item(before_id))
+                return
             self.send_json(404, {"error": "Unknown route"})
 
         def do_POST(self) -> None:
@@ -245,6 +260,23 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(200, result)
                 except Exception as exc:
                     log_api(f"OCR_LINE_REVIEW error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/ocr-line2-review/decision":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    payload = json.loads(data.decode("utf-8")) if data else {}
+                    label_item_id = int(payload.get("label_item_id") or 0)
+                    decision = str(payload.get("decision") or "")
+                    lines = payload.get("lines") or []
+                    if label_item_id <= 0:
+                        raise ValueError("label_item_id is required")
+                    result = submit_ocr_line2_review_decision(label_item_id, decision, lines)
+                    self.send_json(200, result)
+                except Exception as exc:
+                    log_api(f"OCR_LINE2_REVIEW error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 return
 
