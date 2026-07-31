@@ -480,7 +480,7 @@ def crop_line_images(
             continue
         left = 0
         right = width
-        if env_value(env, "READMRZ_OCR_LINE2_TRIM_X", "true").strip().lower() in {"1", "true", "yes", "on"}:
+        if env_value(env, "READMRZ_OCR_LINE2_TRIM_X", "false").strip().lower() in {"1", "true", "yes", "on"}:
             left, right = trim_line_x_bounds(image, width, env)
             image = image[:, left:right].copy()
         line_height, line_width = image.shape[:2]

@@ -45,6 +45,7 @@ class YoloMrzDetector:
             "yes",
             "on",
         }
+        self.rotation_fallback_min_conf = float(env_value(env, "READMRZ_YOLO_ROTATION_FALLBACK_MIN_CONF", "0.85"))
 
         started = time.perf_counter()
         self.model = YOLO(str(model_path))
@@ -69,6 +70,7 @@ class YoloMrzDetector:
             "conf": self.conf,
             "device": self.device,
             "rotation_fallback_enabled": self.rotation_fallback,
+            "rotation_fallback_min_conf": self.rotation_fallback_min_conf,
             "fallback_used": bool(best_detection and best_detection.rotation_angle != 0),
             "selected_rotation_angle": best_detection.rotation_angle if best_detection else 0,
             "attempts": attempts,
@@ -89,7 +91,13 @@ class YoloMrzDetector:
             original_height=original_height,
         )
         attempts = [first_attempt]
-        if detections or not self.rotation_fallback:
+        best_detections = detections
+        best_confidence = detections[0].confidence if detections else 0.0
+        should_try_rotations = (
+            self.rotation_fallback
+            and (not detections or best_confidence < self.rotation_fallback_min_conf)
+        )
+        if not should_try_rotations:
             return detections, attempts
 
         for rotation_angle, rotated_image in rotated_candidates(image):
@@ -100,10 +108,12 @@ class YoloMrzDetector:
                 original_height=original_height,
             )
             attempts.append(attempt)
-            if rotated_detections:
-                return rotated_detections, attempts
+            rotated_confidence = rotated_detections[0].confidence if rotated_detections else 0.0
+            if rotated_confidence > best_confidence:
+                best_confidence = rotated_confidence
+                best_detections = rotated_detections
 
-        return [], attempts
+        return best_detections, attempts
 
     def _detect_once(
         self,
