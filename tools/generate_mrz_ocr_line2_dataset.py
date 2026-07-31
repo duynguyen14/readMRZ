@@ -28,7 +28,7 @@ from generate_mrz_yolo_dataset import (  # noqa: E402
     line_mrz_likeness,
     read_env_file,
 )
-from mrz_reader.db import connect  # noqa: E402
+from mrz_reader.db import connect, execute_sql_file  # noqa: E402
 from mrz_reader.env_config import yolo_dataset_dir  # noqa: E402
 from mrz_reader.mrz import normalize_mrz_text  # noqa: E402
 
@@ -72,9 +72,25 @@ def row_to_dict(cursor: Any, row: Any) -> dict[str, Any]:
     return dict(zip(columns, row))
 
 
-def fetch_approved_label_items(cursor: Any, *, limit: int, force: bool) -> list[dict[str, Any]]:
+def ensure_line2_schema() -> None:
+    execute_sql_file(PROJECT_ROOT / "sql" / "create_mrz_ocr_line2_tables.sql")
+
+
+def fetch_approved_label_items(
+    cursor: Any,
+    *,
+    limit: int,
+    force: bool,
+    include_augmented: bool,
+    split: str,
+) -> list[dict[str, Any]]:
     top_clause = f"TOP {limit}" if limit > 0 else ""
     force_filter = "" if force else "AND ISNULL(mrz_line2_extract_status, '') <> 'done'"
+    augmented_filter = "" if include_augmented else "AND source_key NOT LIKE '%__rot90' AND source_key NOT LIKE '%__rot180' AND source_key NOT LIKE '%__rot270'"
+    split_filter = "AND split = ?" if split else ""
+    params: list[Any] = []
+    if split:
+        params.append(split)
     cursor.execute(
         f"""
         SELECT {top_clause}
@@ -95,8 +111,11 @@ def fetch_approved_label_items(cursor: Any, *, limit: int, force: bool) -> list[
           AND bbox_x2 IS NOT NULL
           AND bbox_y2 IS NOT NULL
           {force_filter}
+          {augmented_filter}
+          {split_filter}
         ORDER BY id ASC
-        """
+        """,
+        *params,
     )
     return [row_to_dict(cursor, row) for row in cursor.fetchall()]
 
@@ -514,8 +533,10 @@ def process_item(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Generate MRZ OCR line2 dataset using OpenCV deskew/projection + PaddleOCR text.")
     parser.add_argument("--env", default=str(PROJECT_ROOT / ".env"), help="Path to .env config file.")
-    parser.add_argument("--limit", type=int, default=0, help="Optional max approved boxes to process.")
+    parser.add_argument("--limit", type=int, default=1000, help="Max approved boxes to process. Use 0 to process all.")
     parser.add_argument("--force", action="store_true", help="Regenerate line2 records even when parent is already done.")
+    parser.add_argument("--include-augmented", action="store_true", help="Also process records whose source_key ends with __rot90/__rot180/__rot270.")
+    parser.add_argument("--split", choices=["train", "val"], default="", help="Optional YOLO split filter.")
     return parser
 
 
@@ -532,12 +553,24 @@ def main() -> int:
     if reexec_code is not None:
         return reexec_code
 
+    ensure_line2_schema()
+
     dataset_dir = yolo_dataset_dir(env)
-    image_base_dir = resolve_base_dir(env, "READMRZ_YOLO_IMAGE_BASE_DIR", dataset_dir / "images")
+    image_base_dir = (dataset_dir / "images").expanduser().resolve()
     line2_dataset_dir = resolve_base_dir(env, "READMRZ_OCR_LINE2_DATASET_DIR", PROJECT_ROOT / "generated_datasets" / "mrz_ocr_lines2")
     line2_image_base_dir = resolve_base_dir(env, "READMRZ_OCR_LINE2_IMAGE_BASE_DIR", line2_dataset_dir / "images")
     line2_crop_base_dir = resolve_base_dir(env, "READMRZ_OCR_LINE2_CROP_BASE_DIR", line2_dataset_dir / "crops")
     batch_size = max(1, env_int(env, "READMRZ_OCR_LINE2_BATCH_SIZE", 25))
+
+    print(f"dataset_dir: {dataset_dir}")
+    print(f"image_base_dir: {image_base_dir}")
+    print(f"line2_dataset_dir: {line2_dataset_dir}")
+    print(f"line2_image_base_dir: {line2_image_base_dir}")
+    print(f"line2_crop_base_dir: {line2_crop_base_dir}")
+    print(f"limit: {args.limit}")
+    print(f"force: {args.force}")
+    print(f"include_augmented: {args.include_augmented}")
+    print(f"split: {args.split or 'all'}")
 
     ocr = build_ocr(env)
     total = 0
@@ -549,7 +582,13 @@ def main() -> int:
         temp_dir = Path(temp_name)
         with connect() as connection:
             cursor = connection.cursor()
-            items = fetch_approved_label_items(cursor, limit=args.limit, force=args.force)
+            items = fetch_approved_label_items(
+                cursor,
+                limit=args.limit,
+                force=args.force,
+                include_augmented=args.include_augmented,
+                split=args.split,
+            )
             total = len(items)
             print(f"Found {total} approved MRZ boxes to extract with OpenCV line2")
             for index, item in enumerate(items, start=1):
@@ -579,7 +618,11 @@ def main() -> int:
                         no_lines += 1
                 except Exception as exc:
                     status = "error"
-                    mark_parent2(cursor, int(item["id"]), status="error", count=0, error=str(exc))
+                    error_text = str(exc)
+                    try:
+                        mark_parent2(cursor, int(item["id"]), status="error", count=0, error=error_text)
+                    except Exception as mark_exc:
+                        error_text = f"{error_text}; mark_parent_failed={mark_exc}"
                     errors += 1
 
                 if index % batch_size == 0:
@@ -589,6 +632,7 @@ def main() -> int:
                     f"[{index}/{total}] source={item['source_key']} "
                     f"status={status} lines={line_count} bands={band_count} "
                     f"angle={deskew_angle:.2f} elapsed_ms={elapsed_ms}"
+                    + (f" error={error_text}" if status == "error" else "")
                 )
             connection.commit()
 
