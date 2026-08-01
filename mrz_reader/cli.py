@@ -36,7 +36,10 @@ from .ocr_line3_review import (
     get_previous_ocr_line3_review_item,
     submit_ocr_line3_review_decision,
 )
+from .document_orientation import PaddleDocumentOrientation
+from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .yolo_detector import YoloMrzDetector
+from .yolo_upload_pipeline import process_yolo_upload
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "readmrz-api.log"
@@ -122,6 +125,8 @@ def decode_request_image(data: bytes, content_type: str):
 def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     engine: MrzOcrEngine | None = None
     yolo_detector: YoloMrzDetector | None = None
+    document_orientation: PaddleDocumentOrientation | None = None
+    custom_mrz_ocr: CustomMrzCtcRecognizer | None = None
 
     def get_engine() -> MrzOcrEngine:
         nonlocal engine
@@ -137,6 +142,28 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             yolo_detector = YoloMrzDetector()
             log_api(f"Loaded MRZ YOLO detector model_load_ms={yolo_detector.load_ms}")
         return yolo_detector
+
+    def get_document_orientation() -> PaddleDocumentOrientation:
+        nonlocal document_orientation
+        if document_orientation is None:
+            log_api("Loading Paddle document orientation model")
+            document_orientation = PaddleDocumentOrientation()
+            log_api(
+                "Loaded Paddle document orientation model "
+                f"enabled={document_orientation.enabled} model_load_ms={document_orientation.load_ms}"
+            )
+        return document_orientation
+
+    def get_custom_mrz_ocr() -> CustomMrzCtcRecognizer:
+        nonlocal custom_mrz_ocr
+        if custom_mrz_ocr is None:
+            log_api("Loading custom MRZ CTC recognizer")
+            custom_mrz_ocr = CustomMrzCtcRecognizer()
+            log_api(
+                "Loaded custom MRZ CTC recognizer "
+                f"enabled={custom_mrz_ocr.enabled} model_load_ms={custom_mrz_ocr.load_ms}"
+            )
+        return custom_mrz_ocr
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
@@ -319,7 +346,12 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     data = self.rfile.read(length)
                     content_type = self.headers.get("Content-Type", "")
                     image, input_name = decode_request_image(data, content_type)
-                    payload = get_yolo_detector().detect(image)
+                    payload = process_yolo_upload(
+                        image,
+                        get_yolo_detector(),
+                        get_document_orientation(),
+                        get_custom_mrz_ocr(),
+                    )
                     payload["input"] = input_name
                     payload["latency_ms"] = int((time.perf_counter() - request_started) * 1000)
                     log_api(
@@ -328,6 +360,10 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                         f"boxes={len(payload['boxes'])} detector_ms={payload['detector_ms']} "
                         f"fallback_used={payload.get('fallback_used')} "
                         f"rotation={payload.get('selected_rotation_angle')} "
+                        f"paddle_rotation={payload.get('orientation', {}).get('applied_angle')} "
+                        f"lines={len(payload.get('line_crops', []))} "
+                        f"ocr_found={payload.get('mrz_ocr', {}).get('found')} "
+                        f"ocr_ms={payload.get('processing', {}).get('ocr_ms')} "
                         f"latency_ms={payload['latency_ms']}"
                     )
                     self.send_json(200, payload)
