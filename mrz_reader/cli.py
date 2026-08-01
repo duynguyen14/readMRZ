@@ -38,7 +38,7 @@ from .ocr_line3_review import (
 )
 from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
-from .env_config import read_env_file
+from .env_config import env_value, read_env_file
 from .yolo_detector import YoloMrzDetector
 from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
@@ -125,6 +125,24 @@ def decode_request_image(data: bytes, content_type: str):
 
 def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     server_env = read_env_file()
+    opencv_cpu_threads = max(
+        1, int(env_value(server_env, "READMRZ_OPENCV_CPU_THREADS", "2"))
+    )
+    cv2.setNumThreads(opencv_cpu_threads)
+    yolo_cpu_threads = max(
+        1, int(env_value(server_env, "READMRZ_YOLO_CPU_THREADS", "8"))
+    )
+    orientation_cpu_threads = max(
+        1, int(env_value(server_env, "READMRZ_ORIENTATION_CPU_THREADS", "2"))
+    )
+    ocr_cpu_threads = max(
+        1, int(env_value(server_env, "READMRZ_CUSTOM_OCR_CPU_THREADS", "4"))
+    )
+    log_api(
+        "CPU thread limits "
+        f"yolo={yolo_cpu_threads} orientation={orientation_cpu_threads} "
+        f"ocr={ocr_cpu_threads} opencv={cv2.getNumThreads()}"
+    )
     engine: MrzOcrEngine | None = None
     yolo_detector: YoloMrzDetector | None = None
     document_orientation: PaddleDocumentOrientation | None = None
@@ -209,6 +227,8 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
             self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header("Access-Control-Max-Age", "86400")
+            self.send_header("Content-Length", "0")
             self.end_headers()
 
         def do_GET(self) -> None:

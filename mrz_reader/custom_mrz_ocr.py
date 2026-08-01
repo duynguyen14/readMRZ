@@ -19,6 +19,9 @@ class CustomMrzCtcRecognizer:
         env = read_env_file()
         self.enabled = env_bool(env, "READMRZ_CUSTOM_OCR_ENABLED", False)
         self.device = env_value(env, "READMRZ_CUSTOM_OCR_DEVICE", "cpu")
+        self.cpu_threads = max(
+            1, int(env_value(env, "READMRZ_CUSTOM_OCR_CPU_THREADS", "4"))
+        )
         self.batch_size = max(1, int(env_value(env, "READMRZ_CUSTOM_OCR_BATCH_SIZE", "2")))
         self.min_confidence = float(env_value(env, "READMRZ_CUSTOM_OCR_MIN_CONF", "0.0"))
         self.model_dir: Path | None = None
@@ -133,6 +136,7 @@ class CustomMrzCtcRecognizer:
             "enabled": self.enabled,
             "engine": "paddle-text-recognition-ctc",
             "device": self.device,
+            "cpu_threads": self.cpu_threads,
             "batch_size": self.batch_size,
             "min_confidence": self.min_confidence,
             "model_dir": str(self.model_dir) if self.model_dir else None,

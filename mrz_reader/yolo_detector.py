@@ -40,6 +40,9 @@ class YoloMrzDetector:
         self.imgsz = int(env_value(env, "READMRZ_YOLO_IMGSZ", "640"))
         self.conf = float(env_value(env, "READMRZ_YOLO_CONF", "0.25"))
         self.device = env_value(env, "READMRZ_YOLO_DEVICE", "cpu")
+        self.cpu_threads = max(
+            1, int(env_value(env, "READMRZ_YOLO_CPU_THREADS", "8"))
+        )
         self.rotation_fallback = env_value(env, "READMRZ_YOLO_ROTATION_FALLBACK", "true").lower() in {
             "1",
             "true",
@@ -47,6 +50,11 @@ class YoloMrzDetector:
             "on",
         }
         self.rotation_fallback_min_conf = float(env_value(env, "READMRZ_YOLO_ROTATION_FALLBACK_MIN_CONF", "0.85"))
+
+        if self.device.strip().lower().startswith("cpu"):
+            import torch
+
+            torch.set_num_threads(self.cpu_threads)
 
         started = time.perf_counter()
         self.model = YOLO(str(model_path))
@@ -85,6 +93,7 @@ class YoloMrzDetector:
             "imgsz": self.imgsz,
             "conf": self.conf,
             "device": self.device,
+            "cpu_threads": self.cpu_threads,
             "rotation_fallback_enabled": self.rotation_fallback,
             "rotation_fallback_min_conf": self.rotation_fallback_min_conf,
             "fallback_used": bool(best_detection and best_detection.rotation_angle != 0),

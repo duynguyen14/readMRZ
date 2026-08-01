@@ -31,6 +31,9 @@ class PaddleDocumentOrientation:
             env_value(env, "READMRZ_YOLO_PADDLE_ORIENTATION_MIN_CONF", "0.50")
         )
         self.device = env_value(env, "PADDLE_OCR_DEVICE", "cpu")
+        self.cpu_threads = max(
+            1, int(env_value(env, "READMRZ_ORIENTATION_CPU_THREADS", "2"))
+        )
         self.model_path: Path | None = None
         self.model: Any | None = None
         self.load_ms = 0
@@ -50,6 +53,8 @@ class PaddleDocumentOrientation:
             ) from exc
 
         kwargs: dict[str, Any] = {"device": self.device}
+        if self.device.strip().lower().startswith("cpu"):
+            kwargs["cpu_threads"] = self.cpu_threads
         if self.model_path is not None:
             kwargs["model_dir"] = str(self.model_path)
 
@@ -75,6 +80,7 @@ class PaddleDocumentOrientation:
                 "latency_ms": 0,
                 "model_load_ms": self.load_ms,
                 "device": self.device,
+                "cpu_threads": self.cpu_threads,
             }
 
         started = time.perf_counter()
@@ -105,6 +111,7 @@ class PaddleDocumentOrientation:
             "latency_ms": latency_ms,
             "model_load_ms": self.load_ms,
             "device": self.device,
+            "cpu_threads": self.cpu_threads,
             "image_width": width,
             "image_height": height,
         }
