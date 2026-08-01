@@ -36,8 +36,9 @@ from .ocr_line3_review import (
     get_previous_ocr_line3_review_item,
     submit_ocr_line3_review_decision,
 )
-from .document_orientation import PaddleDocumentOrientation
+from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
+from .env_config import read_env_file
 from .yolo_detector import YoloMrzDetector
 from .yolo_upload_pipeline import process_yolo_upload
 
@@ -123,6 +124,7 @@ def decode_request_image(data: bytes, content_type: str):
 
 
 def run_server(port: int, *, host: str = "127.0.0.1") -> int:
+    server_env = read_env_file()
     engine: MrzOcrEngine | None = None
     yolo_detector: YoloMrzDetector | None = None
     document_orientation: PaddleDocumentOrientation | None = None
@@ -164,6 +166,17 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 f"enabled={custom_mrz_ocr.enabled} model_load_ms={custom_mrz_ocr.load_ms}"
             )
         return custom_mrz_ocr
+
+    if env_bool(server_env, "READMRZ_API_PRELOAD_MODELS", True):
+        preload_started = time.perf_counter()
+        log_api("Preloading upload pipeline models")
+        get_document_orientation()
+        get_yolo_detector()
+        get_custom_mrz_ocr()
+        log_api(
+            "Preloaded upload pipeline models "
+            f"total_ms={int((time.perf_counter() - preload_started) * 1000)}"
+        )
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:

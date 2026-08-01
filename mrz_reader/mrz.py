@@ -112,6 +112,7 @@ def parse_td3(lines: list[str]) -> MrzParseResult:
         check("composite", l2[0:10] + l2[13:20] + l2[21:43], l2[43:44]),
     ]
     fields: dict[str, str | None] = {
+        "document_code": l1[0:2],
         "issuing_country": l1[2:5],
         "surname": surname,
         "given_names": given_names,
@@ -135,6 +136,7 @@ def parse_mrv_a(lines: list[str]) -> MrzParseResult:
         check("expiry_date", l2[21:27], l2[27:28]),
     ]
     fields: dict[str, str | None] = {
+        "document_code": l1[0:2],
         "issuing_country": l1[2:5],
         "surname": surname,
         "given_names": given_names,
@@ -158,6 +160,7 @@ def parse_mrv_b(lines: list[str]) -> MrzParseResult:
         check("expiry_date", l2[21:27], l2[27:28]),
     ]
     fields: dict[str, str | None] = {
+        "document_code": l1[0:2],
         "issuing_country": l1[2:5],
         "surname": surname,
         "given_names": given_names,
@@ -183,6 +186,7 @@ def parse_td1(lines: list[str]) -> MrzParseResult:
         check("composite", l1[5:30] + l2[0:7] + l2[8:15] + l2[18:29], l2[29:30]),
     ]
     fields: dict[str, str | None] = {
+        "document_code": l1[0:2],
         "issuing_country": l1[2:5],
         "surname": surname,
         "given_names": given_names,
