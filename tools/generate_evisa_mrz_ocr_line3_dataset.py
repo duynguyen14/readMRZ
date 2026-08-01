@@ -37,6 +37,7 @@ from generate_mrz_yolo_dataset import (  # noqa: E402
     read_env_file,
 )
 from generate_mrz_ocr_line2_dataset import (  # noqa: E402
+    binarize_for_text,
     crop_line_images,
     deskew_crop,
     line2_ocr_env,
@@ -468,6 +469,77 @@ def rotate_vertical_crop_if_needed(crop: np.ndarray, env: dict[str, str]) -> tup
     return np.ascontiguousarray(np.rot90(crop, 3)), 90
 
 
+def filler_orientation_score(crop: np.ndarray, env: dict[str, str]) -> tuple[float, int]:
+    binary = binarize_for_text(crop)
+    component_count, _, stats, _ = cv2.connectedComponentsWithStats(binary, 8)
+    image_height, image_width = binary.shape[:2]
+    min_height = max(6, int(round(image_height * 0.08)))
+    max_height = max(min_height + 1, int(round(image_height * 0.60)))
+    min_area = max(8, env_int(env, "READMRZ_EVISA_LINE3_180_MIN_COMPONENT_AREA", 10))
+    scores: list[float] = []
+
+    for index in range(1, component_count):
+        x, y, width, height, area = stats[index]
+        if not (3 <= width <= min(55, image_width) and min_height <= height <= max_height and area >= min_area):
+            continue
+
+        aspect = width / max(1, height)
+        if not (0.18 <= aspect <= 1.25):
+            continue
+
+        component = binary[y : y + height, x : x + width]
+        local_y, local_x = np.where(component > 0)
+        if local_x.size < min_area:
+            continue
+
+        top_mask = local_y <= height * 0.35
+        middle_mask = (local_y > height * 0.35) & (local_y < height * 0.65)
+        bottom_mask = local_y >= height * 0.65
+        if top_mask.sum() < 2 or middle_mask.sum() < 2 or bottom_mask.sum() < 2:
+            continue
+
+        top_mean = float(local_x[top_mask].mean())
+        middle_mean = float(local_x[middle_mask].mean())
+        bottom_mean = float(local_x[bottom_mask].mean())
+        if abs(top_mean - bottom_mean) > width * 0.40:
+            continue
+
+        # Upright filler '<' has its top/bottom strokes to the right of the middle vertex.
+        # Upside-down text turns those fillers into visual '>', making this value negative.
+        score = ((top_mean + bottom_mean) / 2.0 - middle_mean) / max(1, width)
+        if abs(score) >= env_float(env, "READMRZ_EVISA_LINE3_180_COMPONENT_SCORE_MIN", 0.08):
+            scores.append(score)
+
+    if not scores:
+        return 0.0, 0
+    return float(sum(scores)), len(scores)
+
+
+def rotate_upside_down_crop_if_needed(crop: np.ndarray, env: dict[str, str]) -> tuple[np.ndarray, int, dict[str, Any]]:
+    if not env_bool(env, "READMRZ_EVISA_LINE3_AUTO_ROTATE_180", True):
+        return crop, 0, {"enabled": False}
+
+    score_0, count_0 = filler_orientation_score(crop, env)
+    rotated_180 = np.ascontiguousarray(np.rot90(crop, 2))
+    score_180, count_180 = filler_orientation_score(rotated_180, env)
+    min_components = env_int(env, "READMRZ_EVISA_LINE3_180_MIN_COMPONENTS", 6)
+    min_delta = env_float(env, "READMRZ_EVISA_LINE3_180_MIN_SCORE_DELTA", 0.50)
+    should_rotate = (
+        max(count_0, count_180) >= min_components
+        and score_180 > 0
+        and score_180 > score_0 + min_delta
+    )
+    details = {
+        "enabled": True,
+        "score_0": round(score_0, 4),
+        "score_180": round(score_180, 4),
+        "count_0": count_0,
+        "count_180": count_180,
+        "rotated": should_rotate,
+    }
+    return (rotated_180, 180, details) if should_rotate else (crop, 0, details)
+
+
 def write_line_row3(
     cursor: Any,
     *,
@@ -622,8 +694,11 @@ def process_record(
     if raw_crop.size == 0:
         raise ValueError(f"MRZ crop is empty for {source_key}")
 
-    normalized_crop, vertical_rotation_angle = rotate_vertical_crop_if_needed(raw_crop, env)
-    doc_orientation_angle = (int(detection["rotation_angle"]) + vertical_rotation_angle) % 360
+    vertical_crop, vertical_rotation_angle = rotate_vertical_crop_if_needed(raw_crop, env)
+    normalized_crop, upside_down_rotation_angle, orientation_details = rotate_upside_down_crop_if_needed(vertical_crop, env)
+    doc_orientation_angle = (
+        int(detection["rotation_angle"]) + vertical_rotation_angle + upside_down_rotation_angle
+    ) % 360
     deskewed_crop, binary, deskew_angle = deskew_crop(normalized_crop, env)
     bands = projection_bands(binary, env)
     lines = crop_line_images(deskewed_crop, bands, env)
@@ -654,6 +729,7 @@ def process_record(
             "bands": len(bands),
             "confidence": float(detection["confidence"]),
             "rotation_angle": doc_orientation_angle,
+            "orientation": orientation_details,
         }
 
     line_output_dir = line_image_base_dir / split
@@ -716,6 +792,7 @@ def process_record(
         "bands": len(bands),
         "confidence": float(detection["confidence"]),
         "rotation_angle": doc_orientation_angle,
+        "orientation": orientation_details,
     }
 
 
@@ -873,6 +950,11 @@ def main() -> int:
                     f"status={result.get('status')} lines={result.get('lines', 0)} "
                     f"conf={float(result.get('confidence') or 0.0):.4f} "
                     f"rot={result.get('rotation_angle', 0)} elapsed_ms={elapsed_ms}"
+                    + (
+                        f" crop180={result.get('orientation', {}).get('rotated')}"
+                        if isinstance(result.get("orientation"), dict)
+                        else ""
+                    )
                     + (f" error={result.get('error')}" if result.get("error") else "")
                 )
 
