@@ -71,7 +71,8 @@ class CustomMrzCtcRecognizer:
             str(self.model_dir / "inference.pdiparams"),
         )
         configure_device(config, self.device, env)
-        config.enable_memory_optim()
+        if env_bool(env, "READMRZ_CUSTOM_OCR_MEMORY_OPTIM", False):
+            config.enable_memory_optim()
         config.disable_glog_info()
         self.model = paddle_infer.create_predictor(config)
         input_names = self.model.get_input_names()
