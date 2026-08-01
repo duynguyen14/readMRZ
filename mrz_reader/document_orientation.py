@@ -57,6 +57,13 @@ class PaddleDocumentOrientation:
         self.model = DocImgOrientationClassification(**kwargs)
         self.load_ms = int((time.perf_counter() - started) * 1000)
 
+    def warmup(self) -> int:
+        if not self.enabled or self.model is None:
+            return 0
+        image = np.full((224, 224, 3), 255, dtype=np.uint8)
+        _, payload = self.normalize(image)
+        return int(payload["latency_ms"])
+
     def normalize(self, image: np.ndarray) -> tuple[np.ndarray, dict[str, Any]]:
         if not self.enabled or self.model is None:
             return image, {

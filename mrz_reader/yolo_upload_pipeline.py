@@ -26,15 +26,18 @@ def process_yolo_upload(
     detector: YoloMrzDetector,
     orientation: PaddleDocumentOrientation,
     recognizer: CustomMrzCtcRecognizer,
+    *,
+    include_images: bool = True,
 ) -> dict[str, Any]:
     pipeline_started = time.perf_counter()
     env = read_env_file()
     normalized_image, orientation_payload = orientation.normalize(image)
     payload = detector.detect(normalized_image)
     payload["orientation"] = orientation_payload
-    payload["oriented_image"] = encoded_image(normalized_image)
-    payload["mrz_raw_crop"] = None
-    payload["mrz_crop"] = None
+    if include_images:
+        payload["oriented_image"] = encoded_image(normalized_image)
+        payload["mrz_raw_crop"] = None
+        payload["mrz_crop"] = None
     payload["line_crops"] = []
     payload["mrz_ocr"] = empty_ocr_payload(recognizer)
     payload["cropper"] = {
@@ -73,20 +76,23 @@ def process_yolo_upload(
         lines = crop_line_images(deskewed_crop, bands, env)
         payload["processing"]["crop_ms"] = int((time.perf_counter() - crop_started) * 1000)
 
-        payload["mrz_raw_crop"] = {
-            **encoded_image(raw_crop),
-            "bbox_xyxy": [x1, y1, x2, y2],
-        }
-        payload["mrz_crop"] = encoded_image(deskewed_crop)
-        line_payloads = [
-            {
-                **encoded_image(line["image"]),
+        if include_images:
+            payload["mrz_raw_crop"] = {
+                **encoded_image(raw_crop),
+                "bbox_xyxy": [x1, y1, x2, y2],
+            }
+            payload["mrz_crop"] = encoded_image(deskewed_crop)
+
+        line_payloads = []
+        for index, line in enumerate(lines, start=1):
+            line_payload = {
                 "line_index": index,
                 "bbox_crop": line["bbox_crop"],
                 "projection_score": round(float(line["projection_score"]), 4),
             }
-            for index, line in enumerate(lines, start=1)
-        ]
+            if include_images:
+                line_payload.update(encoded_image(line["image"]))
+            line_payloads.append(line_payload)
         payload["line_crops"] = line_payloads
         payload["cropper"].update(
             {
@@ -208,3 +214,35 @@ def empty_ocr_payload(
 
 def finish_pipeline_timing(payload: dict[str, Any], started: float) -> None:
     payload["processing"]["pipeline_ms"] = int((time.perf_counter() - started) * 1000)
+
+
+def compact_yolo_read_payload(payload: dict[str, Any]) -> dict[str, Any]:
+    ocr_payload = payload.get("mrz_ocr") or {}
+    cropper_payload = payload.get("cropper") or {}
+    lines = [
+        {
+            "line_index": int(line.get("line_index") or index),
+            "text": str(line.get("ocr_normalized_text") or line.get("ocr_text") or ""),
+            "confidence": round(float(line.get("ocr_confidence") or 0.0), 6),
+            "accepted": bool(line.get("ocr_accepted")),
+        }
+        for index, line in enumerate(payload.get("line_crops") or [], start=1)
+    ]
+
+    error = ocr_payload.get("error") or cropper_payload.get("error")
+    if not error and not payload.get("found"):
+        error = "MRZ region was not detected"
+
+    return {
+        "found": bool(ocr_payload.get("found")),
+        "document_type": ocr_payload.get("document_type"),
+        "checksum_pass": bool(ocr_payload.get("checksum_pass")),
+        "confidence": round(float(ocr_payload.get("confidence") or 0.0), 6),
+        "detector_confidence": round(float(ocr_payload.get("detector_confidence") or 0.0), 6),
+        "average_ocr_confidence": round(float(ocr_payload.get("average_confidence") or 0.0), 6),
+        "lines": lines,
+        "fields": ocr_payload.get("fields") or {},
+        "checks": ocr_payload.get("checks") or [],
+        "processing": payload.get("processing") or {},
+        "error": error,
+    }

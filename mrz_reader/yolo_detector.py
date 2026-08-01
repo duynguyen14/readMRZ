@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+from threading import Lock
 import time
 from typing import Any
 
@@ -50,6 +51,21 @@ class YoloMrzDetector:
         started = time.perf_counter()
         self.model = YOLO(str(model_path))
         self.load_ms = int((time.perf_counter() - started) * 1000)
+        self._predict_lock = Lock()
+
+    def warmup(self) -> int:
+        started = time.perf_counter()
+        image = np.zeros((self.imgsz, self.imgsz, 3), dtype=np.uint8)
+        with self._predict_lock:
+            self.model.predict(
+                source=image,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                device=self.device,
+                max_det=1,
+                verbose=False,
+            )
+        return int((time.perf_counter() - started) * 1000)
 
     def detect(self, image: np.ndarray) -> dict[str, Any]:
         height, width = image.shape[:2]
@@ -125,13 +141,15 @@ class YoloMrzDetector:
     ) -> tuple[list[YoloMrzDetection], dict[str, Any]]:
         rotated_height, rotated_width = image.shape[:2]
         started = time.perf_counter()
-        results = self.model.predict(
-            source=image,
-            imgsz=self.imgsz,
-            conf=self.conf,
-            device=self.device,
-            verbose=False,
-        )
+        with self._predict_lock:
+            results = self.model.predict(
+                source=image,
+                imgsz=self.imgsz,
+                conf=self.conf,
+                device=self.device,
+                max_det=1,
+                verbose=False,
+            )
         elapsed_ms = int((time.perf_counter() - started) * 1000)
 
         detections: list[YoloMrzDetection] = []

@@ -40,7 +40,7 @@ from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .env_config import read_env_file
 from .yolo_detector import YoloMrzDetector
-from .yolo_upload_pipeline import process_yolo_upload
+from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "readmrz-api.log"
@@ -170,13 +170,23 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     if env_bool(server_env, "READMRZ_API_PRELOAD_MODELS", True):
         preload_started = time.perf_counter()
         log_api("Preloading upload pipeline models")
-        get_document_orientation()
-        get_yolo_detector()
-        get_custom_mrz_ocr()
+        orientation_model = get_document_orientation()
+        detector_model = get_yolo_detector()
+        recognizer_model = get_custom_mrz_ocr()
         log_api(
             "Preloaded upload pipeline models "
             f"total_ms={int((time.perf_counter() - preload_started) * 1000)}"
         )
+        if env_bool(server_env, "READMRZ_API_WARMUP_MODELS", True):
+            warmup_started = time.perf_counter()
+            orientation_ms = orientation_model.warmup()
+            yolo_ms = detector_model.warmup()
+            ocr_ms = recognizer_model.warmup()
+            log_api(
+                "Warmed upload pipeline models "
+                f"orientation_ms={orientation_ms} yolo_ms={yolo_ms} ocr_ms={ocr_ms} "
+                f"total_ms={int((time.perf_counter() - warmup_started) * 1000)}"
+            )
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
@@ -350,6 +360,41 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 except Exception as exc:
                     log_api(f"OCR_LINE3_REVIEW error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/yolo-mrz-read-base64":
+                try:
+                    request_started = time.perf_counter()
+                    content_type = self.headers.get("Content-Type", "")
+                    if "application/json" not in content_type.lower():
+                        raise ValueError("Content-Type must be application/json")
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    image, input_name = decode_request_image(data, content_type)
+                    pipeline_payload = process_yolo_upload(
+                        image,
+                        get_yolo_detector(),
+                        get_document_orientation(),
+                        get_custom_mrz_ocr(),
+                        include_images=False,
+                    )
+                    payload = compact_yolo_read_payload(pipeline_payload)
+                    payload["input"] = input_name
+                    payload["latency_ms"] = int(
+                        (time.perf_counter() - request_started) * 1000
+                    )
+                    log_api(
+                        "YOLO_MRZ_READ_BASE64 done "
+                        f"input={input_name} found={payload['found']} "
+                        f"lines={len(payload['lines'])} "
+                        f"detector_ms={payload['processing'].get('detector_ms')} "
+                        f"ocr_ms={payload['processing'].get('ocr_ms')} "
+                        f"latency_ms={payload['latency_ms']}"
+                    )
+                    self.send_json(200, payload)
+                except Exception as exc:
+                    log_api(f"YOLO_MRZ_READ_BASE64 error {exc}")
+                    self.send_json(400, {"found": False, "error": str(exc)})
                 return
 
             if parsed_url.path == "/yolo-mrz-detect":

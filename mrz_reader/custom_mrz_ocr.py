@@ -85,6 +85,14 @@ class CustomMrzCtcRecognizer:
         self.output_name = output_names[0]
         self.load_ms = int((time.perf_counter() - started) * 1000)
 
+    def warmup(self) -> int:
+        if not self.enabled or self.model is None:
+            return 0
+        _, latency_ms = self.recognize(
+            [np.full((self.image_shape[1], self.image_shape[2], 3), 255, dtype=np.uint8)]
+        )
+        return latency_ms
+
     def recognize(self, images: list[np.ndarray]) -> tuple[list[dict[str, Any]], int]:
         if not images:
             return [], 0
