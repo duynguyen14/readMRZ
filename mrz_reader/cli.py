@@ -45,6 +45,7 @@ from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "readmrz-api.log"
+EXTERNAL_API_KEY = "9148fca3-187c-46d1-95d5-5c8c4b8ea1ad"
 
 
 def log_api(message: str) -> None:
@@ -211,7 +212,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         def log_message(self, format: str, *args) -> None:
             return
 
-        def send_json(self, status: int, payload: dict) -> None:
+        def send_json(self, status: int, payload) -> None:
             body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "application/json; charset=utf-8")
@@ -430,6 +431,55 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 except Exception as exc:
                     log_api(f"YOLO_MRZ_READ_BASE64 error {exc}")
                     self.send_json(400, {"found": False, "error": str(exc)})
+                return
+
+            if parsed_url.path == "/external/mrz-lines":
+                try:
+                    request_started = time.perf_counter()
+                    content_type = self.headers.get("Content-Type", "")
+                    if "application/json" not in content_type.lower():
+                        raise ValueError("Content-Type must be application/json")
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    request_payload = json.loads(data.decode("utf-8")) if data else {}
+                    key = str(request_payload.get("key") or "")
+                    if key != EXTERNAL_API_KEY:
+                        self.send_json(401, {"error": "Invalid API key"})
+                        return
+                    image_base64 = request_payload.get("base64") or request_payload.get("image_base64")
+                    if not isinstance(image_base64, str) or not image_base64.strip():
+                        raise ValueError("base64 is required")
+                    image = decode_base64_image(image_base64)
+                    pipeline_payload = process_yolo_upload(
+                        image,
+                        get_yolo_detector(),
+                        get_document_orientation(),
+                        get_custom_mrz_ocr(),
+                        include_images=False,
+                    )
+                    lines = [
+                        {
+                            "confidence": round(float(line.get("ocr_confidence") or 0.0), 6),
+                            "text": str(
+                                line.get("ocr_normalized_text")
+                                or line.get("ocr_text")
+                                or ""
+                            ),
+                            "warpedBox": [],
+                        }
+                        for line in pipeline_payload.get("line_crops", [])
+                        if str(line.get("ocr_normalized_text") or line.get("ocr_text") or "")
+                    ]
+                    log_api(
+                        "EXTERNAL_MRZ_LINES done "
+                        f"lines={len(lines)} "
+                        f"fallback_used={pipeline_payload.get('ocr_fallback', {}).get('used')} "
+                        f"latency_ms={int((time.perf_counter() - request_started) * 1000)}"
+                    )
+                    self.send_json(200, lines)
+                except Exception as exc:
+                    log_api(f"EXTERNAL_MRZ_LINES error {exc}")
+                    self.send_json(400, [])
                 return
 
             if parsed_url.path == "/yolo-mrz-detect":
