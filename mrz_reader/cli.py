@@ -36,6 +36,7 @@ from .ocr_line3_review import (
     get_previous_ocr_line3_review_item,
     submit_ocr_line3_review_decision,
 )
+from .pipeline_test_review import get_pipeline_test_review_items
 from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .env_config import env_value, read_env_file
@@ -276,6 +277,20 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 params = parse_qs(parsed_url.query)
                 before_id = int(params.get("before_id", ["0"])[0] or "0")
                 self.send_json(200, get_previous_ocr_line3_review_item(before_id))
+                return
+            if parsed_url.path == "/pipeline-test-review/items":
+                params = parse_qs(parsed_url.query)
+                filter_name = params.get("filter", ["all"])[0] or "all"
+                limit = int(params.get("limit", ["50"])[0] or "50")
+                offset = int(params.get("offset", ["0"])[0] or "0")
+                self.send_json(
+                    200,
+                    get_pipeline_test_review_items(
+                        filter_name=filter_name,
+                        limit=limit,
+                        offset=offset,
+                    ),
+                )
                 return
             self.send_json(404, {"error": "Unknown route"})
 
