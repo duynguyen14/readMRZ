@@ -1,7 +1,11 @@
 from __future__ import annotations
 
+import base64
 from datetime import date, datetime
+from pathlib import Path
 from typing import Any
+
+import cv2
 
 from .db import connect
 
@@ -25,6 +29,38 @@ def json_value(value: Any) -> Any:
     if isinstance(value, date):
         return value.isoformat()
     return value
+
+
+def image_thumbnail_payload(path_value: Any) -> dict[str, Any] | None:
+    path = Path(str(path_value or ""))
+    if not path.is_file():
+        return None
+
+    image = cv2.imread(str(path))
+    if image is None:
+        return None
+
+    height, width = image.shape[:2]
+    max_side = 900
+    scale = min(1.0, max_side / max(1, width, height))
+    if scale < 1.0:
+        image = cv2.resize(
+            image,
+            (max(1, int(width * scale)), max(1, int(height * scale))),
+            interpolation=cv2.INTER_AREA,
+        )
+        height, width = image.shape[:2]
+
+    success, buffer = cv2.imencode(".jpg", image, [cv2.IMWRITE_JPEG_QUALITY, 82])
+    if not success:
+        return None
+
+    return {
+        "content_type": "image/jpeg",
+        "image_base64": base64.b64encode(buffer.tobytes()).decode("ascii"),
+        "width": width,
+        "height": height,
+    }
 
 
 def build_where_clause(filter_name: str) -> str:
@@ -94,10 +130,11 @@ def get_pipeline_test_review_items(
             offset,
             limit,
         )
-        rows = [
-            {key: json_value(value) for key, value in row_to_dict(cursor, row).items()}
-            for row in cursor.fetchall()
-        ]
+        rows = []
+        for row in cursor.fetchall():
+            item = {key: json_value(value) for key, value in row_to_dict(cursor, row).items()}
+            item["OriginalImage"] = image_thumbnail_payload(item.get("ImagePath"))
+            rows.append(item)
 
     return {
         "status": "ok",
