@@ -446,7 +446,11 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     if key != EXTERNAL_API_KEY:
                         self.send_json(401, {"error": "Invalid API key"})
                         return
-                    image_base64 = request_payload.get("base64") or request_payload.get("image_base64")
+                    image_base64 = (
+                        request_payload.get("base64")
+                        or request_payload.get("dataBase64")
+                        or request_payload.get("image_base64")
+                    )
                     if not isinstance(image_base64, str) or not image_base64.strip():
                         raise ValueError("base64 is required")
                     image = decode_base64_image(image_base64)
