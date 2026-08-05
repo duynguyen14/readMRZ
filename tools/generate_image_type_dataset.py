@@ -8,6 +8,7 @@ from pathlib import Path
 import random
 import shutil
 import sys
+import time
 from typing import Any
 
 import cv2
@@ -330,6 +331,50 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
         writer.writerows(rows)
 
 
+def remove_tree_or_rename(path: Path) -> None:
+    if not path.exists():
+        return
+
+    last_error: Exception | None = None
+    for _ in range(3):
+        try:
+            shutil.rmtree(path)
+            return
+        except OSError as exc:
+            last_error = exc
+            time.sleep(0.35)
+
+    suffix = time.strftime("%Y%m%d_%H%M%S")
+    renamed = path.with_name(f"{path.name}_old_{suffix}")
+    try:
+        path.rename(renamed)
+        print(
+            f"Warning: cannot delete {path}; renamed old folder to {renamed}. "
+            "Close Explorer/viewers and delete it later."
+        )
+        return
+    except OSError:
+        if last_error is not None:
+            raise last_error
+        raise
+
+
+def clear_managed_outputs(dataset_dir: Path, image_base_dir: Path) -> None:
+    # On Windows, removing the dataset root can fail if Explorer or antivirus keeps
+    # a transient handle. Only clean outputs owned by this script.
+    remove_tree_or_rename(image_base_dir)
+    for file_name in ("labels.csv", "train.csv", "val.csv", "test.csv"):
+        path = dataset_dir / file_name
+        if not path.exists():
+            continue
+        for _ in range(3):
+            try:
+                path.unlink()
+                break
+            except OSError:
+                time.sleep(0.2)
+
+
 def export_csvs(connection: pyodbc.Connection, dataset_dir: Path) -> dict[str, int]:
     cursor = connection.cursor()
     cursor.execute(
@@ -450,9 +495,8 @@ def main() -> int:
         if args.clear:
             destination_cursor.execute("DELETE FROM dbo.readmrz_image_type_dataset_items")
             destination_connection.commit()
-            if dataset_dir.exists():
-                shutil.rmtree(dataset_dir)
-            print("Cleared table dbo.readmrz_image_type_dataset_items and dataset folder")
+            clear_managed_outputs(dataset_dir, image_base_dir)
+            print("Cleared table dbo.readmrz_image_type_dataset_items and managed dataset outputs")
 
         source_cursor = source_connection.cursor()
         records = fetch_records(
