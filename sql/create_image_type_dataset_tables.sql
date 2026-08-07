@@ -39,13 +39,13 @@ BEGIN
             DEFAULT SYSDATETIME(),
 
         CONSTRAINT CK_readmrz_image_type_dataset_items_Label
-            CHECK (Label IN (N'passport', N'face')),
+            CHECK (Label IN (N'passport', N'face', N'EVISA_RESULT', N'VOA_RESULT')),
 
         CONSTRAINT CK_readmrz_image_type_dataset_items_LabelId
-            CHECK (LabelId IN (0, 1)),
+            CHECK (LabelId IN (0, 1, 2, 3)),
 
         CONSTRAINT CK_readmrz_image_type_dataset_items_SourceField
-            CHECK (SourceField IN (N'FullPassportImage', N'FaceImage')),
+            CHECK (SourceField IN (N'FullPassportImage', N'FaceImage', N'FileEVisa', N'FilePath')),
 
         CONSTRAINT CK_readmrz_image_type_dataset_items_Status
             CHECK (Status IN (N'pending', N'copied', N'error', N'skipped')),
@@ -54,6 +54,57 @@ BEGIN
             CHECK (Split IS NULL OR Split IN (N'train', N'val', N'test'))
     );
 END;
+GO
+
+IF EXISTS (
+    SELECT 1
+    FROM sys.check_constraints
+    WHERE name = N'CK_readmrz_image_type_dataset_items_Label'
+      AND parent_object_id = OBJECT_ID(N'dbo.readmrz_image_type_dataset_items')
+)
+BEGIN
+    ALTER TABLE dbo.readmrz_image_type_dataset_items
+    DROP CONSTRAINT CK_readmrz_image_type_dataset_items_Label;
+END;
+GO
+
+ALTER TABLE dbo.readmrz_image_type_dataset_items
+ADD CONSTRAINT CK_readmrz_image_type_dataset_items_Label
+CHECK (Label IN (N'passport', N'face', N'EVISA_RESULT', N'VOA_RESULT'));
+GO
+
+IF EXISTS (
+    SELECT 1
+    FROM sys.check_constraints
+    WHERE name = N'CK_readmrz_image_type_dataset_items_LabelId'
+      AND parent_object_id = OBJECT_ID(N'dbo.readmrz_image_type_dataset_items')
+)
+BEGIN
+    ALTER TABLE dbo.readmrz_image_type_dataset_items
+    DROP CONSTRAINT CK_readmrz_image_type_dataset_items_LabelId;
+END;
+GO
+
+ALTER TABLE dbo.readmrz_image_type_dataset_items
+ADD CONSTRAINT CK_readmrz_image_type_dataset_items_LabelId
+CHECK (LabelId IN (0, 1, 2, 3));
+GO
+
+IF EXISTS (
+    SELECT 1
+    FROM sys.check_constraints
+    WHERE name = N'CK_readmrz_image_type_dataset_items_SourceField'
+      AND parent_object_id = OBJECT_ID(N'dbo.readmrz_image_type_dataset_items')
+)
+BEGIN
+    ALTER TABLE dbo.readmrz_image_type_dataset_items
+    DROP CONSTRAINT CK_readmrz_image_type_dataset_items_SourceField;
+END;
+GO
+
+ALTER TABLE dbo.readmrz_image_type_dataset_items
+ADD CONSTRAINT CK_readmrz_image_type_dataset_items_SourceField
+CHECK (SourceField IN (N'FullPassportImage', N'FaceImage', N'FileEVisa', N'FilePath'));
 GO
 
 IF NOT EXISTS (

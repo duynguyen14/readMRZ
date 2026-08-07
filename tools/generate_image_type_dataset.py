@@ -146,6 +146,7 @@ def upsert_item(
     *,
     record: dict[str, Any],
     source_field: str,
+    source_table: str = "TransactionEVisa",
     source_value: Any,
     label: str,
     label_id: int,
@@ -162,6 +163,7 @@ def upsert_item(
         """
         UPDATE dbo.readmrz_image_type_dataset_items
         SET
+            SourceTable = ?,
             TransactionGuid = ?,
             SourceImageValue = ?,
             Label = ?,
@@ -178,6 +180,7 @@ def upsert_item(
         WHERE TransactionEVisaId = ?
           AND SourceField = ?
         """,
+        source_table,
         str(record.get("GUID")) if record.get("GUID") else None,
         str(source_value or "")[:1000] or None,
         label,
@@ -199,6 +202,7 @@ def upsert_item(
     cursor.execute(
         """
         INSERT INTO dbo.readmrz_image_type_dataset_items (
+            SourceTable,
             TransactionEVisaId,
             TransactionGuid,
             SourceField,
@@ -214,8 +218,9 @@ def upsert_item(
             Status,
             ErrorMessage
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
+        source_table,
         int(record["Id"]),
         str(record.get("GUID")) if record.get("GUID") else None,
         source_field,
@@ -322,6 +327,7 @@ def write_csv(path: Path, rows: list[dict[str, Any]]) -> None:
                 "label",
                 "label_id",
                 "split",
+                "source_table",
                 "source_id",
                 "source_field",
                 "sha256",
@@ -384,6 +390,7 @@ def export_csvs(connection: pyodbc.Connection, dataset_dir: Path) -> dict[str, i
             Label,
             LabelId,
             Split,
+            SourceTable,
             TransactionEVisaId,
             SourceField,
             Sha256
@@ -398,6 +405,7 @@ def export_csvs(connection: pyodbc.Connection, dataset_dir: Path) -> dict[str, i
             "label": row.Label,
             "label_id": int(row.LabelId),
             "split": row.Split,
+            "source_table": row.SourceTable,
             "source_id": int(row.TransactionEVisaId),
             "source_field": row.SourceField,
             "sha256": row.Sha256 or "",
