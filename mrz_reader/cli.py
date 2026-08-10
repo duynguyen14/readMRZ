@@ -483,30 +483,33 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     if not isinstance(image_base64, str) or not image_base64.strip():
                         raise ValueError("base64 is required")
                     image = decode_base64_image(image_base64)
-                    payload = get_file_type_classifier().predict(image)
-                    payload["input"] = str(request_payload.get("filename") or "base64_request")
-                    payload["latencyMs"] = int(
+                    classifier_payload = get_file_type_classifier().predict(image)
+                    latency_ms = int(
                         (time.perf_counter() - request_started) * 1000
                     )
                     log_api(
                         "FILE_TYPE_DETECT_BASE64 done "
-                        f"label={payload.get('label')} "
-                        f"confidence={payload.get('confidence')} "
-                        f"inference_ms={payload.get('processing', {}).get('inferenceMs')} "
-                        f"latency_ms={payload.get('latencyMs')}"
+                        f"label={classifier_payload.get('label')} "
+                        f"confidence={classifier_payload.get('confidence')} "
+                        f"inference_ms={classifier_payload.get('processing', {}).get('inferenceMs')} "
+                        f"latency_ms={latency_ms}"
                     )
-                    self.send_json(200, payload)
+                    self.send_json(
+                        200,
+                        {
+                            "labelId": classifier_payload.get("labelId"),
+                            "label": classifier_payload.get("label"),
+                            "confidence": classifier_payload.get("confidence"),
+                        },
+                    )
                 except Exception as exc:
                     log_api(f"FILE_TYPE_DETECT_BASE64 error {exc}")
                     self.send_json(
                         400,
                         {
-                            "ok": False,
-                            "found": False,
                             "label": None,
                             "labelId": None,
                             "confidence": 0.0,
-                            "probabilities": [],
                             "error": str(exc),
                         },
                     )
