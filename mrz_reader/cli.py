@@ -40,6 +40,7 @@ from .pipeline_test_review import get_pipeline_test_review_items
 from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .env_config import env_value, read_env_file
+from .file_type_classifier import FileTypeClassifier
 from .yolo_detector import YoloMrzDetector
 from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
@@ -118,7 +119,11 @@ def decode_request_image(data: bytes, content_type: str):
             payload = json.loads(data.decode("utf-8"))
         except Exception as exc:
             raise ValueError("Request body must be valid JSON") from exc
-        image_base64 = payload.get("image_base64") or payload.get("base64")
+        image_base64 = (
+            payload.get("image_base64")
+            or payload.get("base64")
+            or payload.get("dataBase64")
+        )
         if not isinstance(image_base64, str) or not image_base64.strip():
             raise ValueError("JSON body must include image_base64")
         return decode_base64_image(image_base64), str(payload.get("filename") or "base64_request")
@@ -149,6 +154,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     yolo_detector: YoloMrzDetector | None = None
     document_orientation: PaddleDocumentOrientation | None = None
     custom_mrz_ocr: CustomMrzCtcRecognizer | None = None
+    file_type_classifier: FileTypeClassifier | None = None
 
     def get_engine() -> MrzOcrEngine:
         nonlocal engine
@@ -187,6 +193,18 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             )
         return custom_mrz_ocr
 
+    def get_file_type_classifier() -> FileTypeClassifier:
+        nonlocal file_type_classifier
+        if file_type_classifier is None:
+            log_api("Loading file type classifier")
+            file_type_classifier = FileTypeClassifier()
+            log_api(
+                "Loaded file type classifier "
+                f"model_load_ms={file_type_classifier.load_ms} "
+                f"classes={file_type_classifier.class_names}"
+            )
+        return file_type_classifier
+
     if env_bool(server_env, "READMRZ_API_PRELOAD_MODELS", True):
         preload_started = time.perf_counter()
         log_api("Preloading upload pipeline models")
@@ -207,6 +225,17 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 f"orientation_ms={orientation_ms} yolo_ms={yolo_ms} ocr_ms={ocr_ms} "
                 f"total_ms={int((time.perf_counter() - warmup_started) * 1000)}"
             )
+
+    if env_bool(server_env, "READMRZ_FILE_DETECT_PRELOAD", True):
+        preload_started = time.perf_counter()
+        classifier_model = get_file_type_classifier()
+        log_api(
+            "Preloaded file type classifier "
+            f"total_ms={int((time.perf_counter() - preload_started) * 1000)}"
+        )
+        if env_bool(server_env, "READMRZ_FILE_DETECT_WARMUP", True):
+            warmup_ms = classifier_model.warmup()
+            log_api(f"Warmed file type classifier warmup_ms={warmup_ms}")
 
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
@@ -431,6 +460,56 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 except Exception as exc:
                     log_api(f"YOLO_MRZ_READ_BASE64 error {exc}")
                     self.send_json(400, {"found": False, "error": str(exc)})
+                return
+
+            if parsed_url.path in {
+                "/file-type-detect-base64",
+                "/detect-file-base64",
+                "/external/file-type-detect",
+            }:
+                try:
+                    request_started = time.perf_counter()
+                    content_type = self.headers.get("Content-Type", "")
+                    if "application/json" not in content_type.lower():
+                        raise ValueError("Content-Type must be application/json")
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    request_payload = json.loads(data.decode("utf-8")) if data else {}
+                    image_base64 = (
+                        request_payload.get("base64")
+                        or request_payload.get("dataBase64")
+                        or request_payload.get("image_base64")
+                    )
+                    if not isinstance(image_base64, str) or not image_base64.strip():
+                        raise ValueError("base64 is required")
+                    image = decode_base64_image(image_base64)
+                    payload = get_file_type_classifier().predict(image)
+                    payload["input"] = str(request_payload.get("filename") or "base64_request")
+                    payload["latencyMs"] = int(
+                        (time.perf_counter() - request_started) * 1000
+                    )
+                    log_api(
+                        "FILE_TYPE_DETECT_BASE64 done "
+                        f"label={payload.get('label')} "
+                        f"confidence={payload.get('confidence')} "
+                        f"inference_ms={payload.get('processing', {}).get('inferenceMs')} "
+                        f"latency_ms={payload.get('latencyMs')}"
+                    )
+                    self.send_json(200, payload)
+                except Exception as exc:
+                    log_api(f"FILE_TYPE_DETECT_BASE64 error {exc}")
+                    self.send_json(
+                        400,
+                        {
+                            "ok": False,
+                            "found": False,
+                            "label": None,
+                            "labelId": None,
+                            "confidence": 0.0,
+                            "probabilities": [],
+                            "error": str(exc),
+                        },
+                    )
                 return
 
             if parsed_url.path == "/external/mrz-lines":

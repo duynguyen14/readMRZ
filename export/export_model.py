@@ -31,7 +31,7 @@ def export_torchscript_to_onnx(model_dir: str) -> Path:
 
 
 def main():
-    model_dir = r"D:\Project Real\AZS\NAB.APP\NAB.APP\dll\model"
+    model_dir = r"D:\Project Real\AZS\NAB.APP\NAB.APP\dll\model\classier_v2"
     onnx_path = export_torchscript_to_onnx(model_dir)
     print(f"Exported: {onnx_path}")
 
