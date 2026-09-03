@@ -114,7 +114,7 @@ def load_config(env: dict[str, str]) -> Config:
     return Config(
         input_dir=input_dir.resolve(),
         output_dir=output_dir.resolve(),
-        batch_size=max(1, env_int(env, "READMRZ_VN_VISA_BATCH_SIZE", 50)),
+        batch_size=max(1, env_int(env, "READMRZ_VN_VISA_BATCH_SIZE", 1)),
         document_type=document_type,
         limit=max(0, env_int(env, "READMRZ_VN_VISA_LIMIT", 0)),
         overwrite=env_bool(env, "READMRZ_VN_VISA_OVERWRITE", False),
@@ -175,6 +175,7 @@ class PaddleVisaOcr:
             "use_doc_unwarping": env_bool(env, "READMRZ_VN_VISA_PADDLE_DOC_UNWARPING", False),
             "use_textline_orientation": env_bool(env, "PADDLE_USE_TEXTLINE_ORIENTATION", True),
             "return_word_box": True,
+            "det_limit_side_len": env_int(env, "PADDLE_DET_LIMIT_SIDE_LEN", 1280),
         }
 
         model_dir_map = {
