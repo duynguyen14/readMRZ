@@ -679,7 +679,6 @@ def insert_records(cursor: Any, records: list[dict[str, Any]]) -> None:
     if not records:
         return
 
-    cursor.fast_executemany = True
     rows = [
         (
             record["SourceTable"],
@@ -753,7 +752,6 @@ def update_records(cursor: Any, records: list[dict[str, Any]]) -> None:
     if not records:
         return
 
-    cursor.fast_executemany = True
     rows = [
         (
             record["DocumentType"],

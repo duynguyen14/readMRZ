@@ -37,6 +37,12 @@ from .ocr_line3_review import (
     submit_ocr_line3_review_decision,
 )
 from .pipeline_test_review import get_pipeline_test_review_items
+from .vn_visa_review import (
+    get_next_vn_visa_review_item,
+    get_previous_vn_visa_review_item,
+    submit_vn_visa_review_decision,
+    correct_vn_visa_review_field,
+)
 from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .env_config import env_value, read_env_file
@@ -322,6 +328,16 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     ),
                 )
                 return
+            if parsed_url.path == "/vn-visa-review/next":
+                params = parse_qs(parsed_url.query)
+                after_key = params.get("after_key", [""])[0]
+                self.send_json(200, get_next_vn_visa_review_item(after_key))
+                return
+            if parsed_url.path == "/vn-visa-review/previous":
+                params = parse_qs(parsed_url.query)
+                before_key = params.get("before_key", [""])[0]
+                self.send_json(200, get_previous_vn_visa_review_item(before_key))
+                return
             self.send_json(404, {"error": "Unknown route"})
 
         def do_POST(self) -> None:
@@ -424,6 +440,40 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(200, result)
                 except Exception as exc:
                     log_api(f"OCR_LINE3_REVIEW error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/vn-visa-review/decision":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    payload = json.loads(data.decode("utf-8")) if data else {}
+                    key = str(payload.get("key") or "")
+                    decision = str(payload.get("decision") or "")
+                    if not key:
+                        raise ValueError("key is required")
+                    result = submit_vn_visa_review_decision(key, decision)
+                    self.send_json(200, result)
+                except Exception as exc:
+                    log_api(f"VN_VISA_REVIEW error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/vn-visa-review/correct-field":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    payload = json.loads(data.decode("utf-8")) if data else {}
+                    key = str(payload.get("key") or "")
+                    field_name = str(payload.get("field_name") or "")
+                    bbox_xyxy = payload.get("bbox_xyxy") or []
+                    normalized_value = str(payload.get("normalized_value") or "")
+                    if not key or not field_name:
+                        raise ValueError("key and field_name are required")
+                    result = correct_vn_visa_review_field(key, field_name, bbox_xyxy, normalized_value)
+                    self.send_json(200, result)
+                except Exception as exc:
+                    log_api(f"VN_VISA_REVIEW_CORRECT_FIELD error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 return
 
