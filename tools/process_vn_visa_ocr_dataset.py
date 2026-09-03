@@ -679,40 +679,7 @@ def insert_records(cursor: Any, records: list[dict[str, Any]]) -> None:
     if not records:
         return
 
-    rows = [
-        (
-            record["SourceTable"],
-            record["SourceId"],
-            record["TransactionEVisaId"],
-            record["TransactionGuid"],
-            record["SourceKey"],
-            record["DocumentType"],
-            record["RelativeImagePath"],
-            record["OrientedRelativeImagePath"],
-            record["OriginalFileName"],
-            record["ImageWidth"],
-            record["ImageHeight"],
-            record["FileSizeBytes"],
-            record["Sha256"],
-            record["Split"],
-            record["Status"],
-            record["ReviewStatus"],
-            record["OcrEngine"],
-            record["OcrConfigJson"],
-            record["OrientationJson"],
-            record["RawOcrJson"],
-            record["RegexVersion"],
-            record["AutoMappingVersion"],
-            record["DataJson"],
-            record["FinalDataJson"],
-            record["ProcessStartedAt"],
-            record["ProcessedAt"],
-            record["ErrorMessage"],
-        )
-        for record in records
-    ]
-    cursor.executemany(
-        """
+    sql = """
         INSERT INTO dbo.readmrz_vn_visa_items (
             SourceTable,
             SourceId,
@@ -742,18 +709,84 @@ def insert_records(cursor: Any, records: list[dict[str, Any]]) -> None:
             ProcessedAt,
             ErrorMessage
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        rows,
-    )
+        VALUES (
+            ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?,
+            CAST(? AS NVARCHAR(MAX)),
+            CAST(? AS NVARCHAR(MAX)),
+            CAST(? AS NVARCHAR(MAX)),
+            ?, ?,
+            CAST(? AS NVARCHAR(MAX)),
+            CAST(? AS NVARCHAR(MAX)),
+            ?, ?, ?
+        )
+    """
+    for record in records:
+        cursor.execute(
+            sql,
+            record["SourceTable"],
+            record["SourceId"],
+            record["TransactionEVisaId"],
+            record["TransactionGuid"],
+            record["SourceKey"],
+            record["DocumentType"],
+            record["RelativeImagePath"],
+            record["OrientedRelativeImagePath"],
+            record["OriginalFileName"],
+            record["ImageWidth"],
+            record["ImageHeight"],
+            record["FileSizeBytes"],
+            record["Sha256"],
+            record["Split"],
+            record["Status"],
+            record["ReviewStatus"],
+            record["OcrEngine"],
+            record["OcrConfigJson"],
+            record["OrientationJson"],
+            record["RawOcrJson"],
+            record["RegexVersion"],
+            record["AutoMappingVersion"],
+            record["DataJson"],
+            record["FinalDataJson"],
+            record["ProcessStartedAt"],
+            record["ProcessedAt"],
+            record["ErrorMessage"],
+        )
 
 
 def update_records(cursor: Any, records: list[dict[str, Any]]) -> None:
     if not records:
         return
 
-    rows = [
-        (
+    sql = """
+        UPDATE dbo.readmrz_vn_visa_items
+        SET
+            DocumentType = ?,
+            RelativeImagePath = ?,
+            OrientedRelativeImagePath = ?,
+            OriginalFileName = ?,
+            ImageWidth = ?,
+            ImageHeight = ?,
+            FileSizeBytes = ?,
+            Sha256 = ?,
+            Status = ?,
+            ReviewStatus = ?,
+            OcrEngine = ?,
+            OcrConfigJson = CAST(? AS NVARCHAR(MAX)),
+            OrientationJson = CAST(? AS NVARCHAR(MAX)),
+            RawOcrJson = CAST(? AS NVARCHAR(MAX)),
+            RegexVersion = ?,
+            AutoMappingVersion = ?,
+            DataJson = CAST(? AS NVARCHAR(MAX)),
+            FinalDataJson = CAST(? AS NVARCHAR(MAX)),
+            ProcessStartedAt = ?,
+            ProcessedAt = ?,
+            ErrorMessage = ?,
+            UpdatedDate = SYSDATETIME()
+        WHERE SourceKey = ?
+    """
+    for record in records:
+        cursor.execute(
+            sql,
             record["DocumentType"],
             record["RelativeImagePath"],
             record["OrientedRelativeImagePath"],
@@ -777,38 +810,6 @@ def update_records(cursor: Any, records: list[dict[str, Any]]) -> None:
             record["ErrorMessage"],
             record["SourceKey"],
         )
-        for record in records
-    ]
-    cursor.executemany(
-        """
-        UPDATE dbo.readmrz_vn_visa_items
-        SET
-            DocumentType = ?,
-            RelativeImagePath = ?,
-            OrientedRelativeImagePath = ?,
-            OriginalFileName = ?,
-            ImageWidth = ?,
-            ImageHeight = ?,
-            FileSizeBytes = ?,
-            Sha256 = ?,
-            Status = ?,
-            ReviewStatus = ?,
-            OcrEngine = ?,
-            OcrConfigJson = ?,
-            OrientationJson = ?,
-            RawOcrJson = ?,
-            RegexVersion = ?,
-            AutoMappingVersion = ?,
-            DataJson = ?,
-            FinalDataJson = ?,
-            ProcessStartedAt = ?,
-            ProcessedAt = ?,
-            ErrorMessage = ?,
-            UpdatedDate = SYSDATETIME()
-        WHERE SourceKey = ?
-        """,
-        rows,
-    )
 
 
 def json_dumps(payload: Any) -> str:
@@ -900,6 +901,11 @@ def run(config: Config, env: dict[str, str]) -> int:
         image_paths = image_paths[: config.limit]
     print(f"Found {len(image_paths)} images under {config.input_dir}")
     print(f"Batch size: {config.batch_size}")
+    print(
+        "Target DB: "
+        f"{env_value(env, 'READMRZ_DB_SERVER', '')}/"
+        f"{env_value(env, 'READMRZ_DB_DATABASE', '')}"
+    )
 
     orientation = PaddleDocumentOrientation()
     if orientation.enabled:
