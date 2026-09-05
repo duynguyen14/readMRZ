@@ -1,0 +1,36 @@
+services:
+  readmrz:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: readmrz-api
+    env_file:
+      - .env
+    environment:
+      READMRZ_API_HOST: 0.0.0.0
+      READMRZ_API_PORT: 8080
+      READMRZ_YOLO_DEVICE: cpu
+      READMRZ_YOLO_MODEL_PATH: /app/models/mrz_yolo11n_best.pt
+      READMRZ_CUSTOM_OCR_DEVICE: cpu
+      READMRZ_CUSTOM_OCR_MODEL_DIR: /app/models/mrz_ocr_ctc
+      READMRZ_CUSTOM_OCR_DICT_PATH: /app/models/mrz_ocr_ctc/mrz_dict.txt
+      PADDLE_OCR_DEVICE: cpu
+      PADDLE_DOC_ORIENTATION_MODEL_DIR: /app/models/PP-LCNet_x1_0_doc_ori
+      PADDLE_TEXTLINE_ORIENTATION_MODEL_DIR: /app/models/PP-LCNet_x1_0_textline_ori
+      PADDLE_TEXT_DETECTION_MODEL_DIR: /app/models/paddle/PP-OCRv5_server_det
+      PADDLE_TEXT_RECOGNITION_MODEL_DIR: /app/models/paddle/en_PP-OCRv5_mobile_rec
+      READMRZ_PADDLE_PYTHON: ""
+      READMRZ_FILE_DETECT_MODEL_PATH: /app/models/file_type_classifier
+      FACE_MATCH_MODEL_DIR: /app/models/opencv_face
+      FACE_MATCH_DETECTOR_MODEL_PATH: /app/models/opencv_face/face_detection_yunet_2023mar.onnx
+      FACE_MATCH_RECOGNIZER_MODEL_PATH: /app/models/opencv_face/face_recognition_sface_2021dec.onnx
+      FACE_MATCH_PREFER_CUDA: "false"
+      OMP_NUM_THREADS: "${READMRZ_OPENCV_CPU_THREADS:-2}"
+      MKL_NUM_THREADS: "${READMRZ_OPENCV_CPU_THREADS:-2}"
+      OPENBLAS_NUM_THREADS: "${READMRZ_OPENCV_CPU_THREADS:-2}"
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./models:/app/models
+      - ./generated_datasets:/app/generated_datasets
+    restart: unless-stopped

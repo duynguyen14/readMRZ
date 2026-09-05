@@ -51,6 +51,71 @@ $body = @{ image_base64 = $b64; filename = "passport.jpg" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/read -Body $body -ContentType "application/json"
 ```
 
+Face match 1-1 keeps the same request/response shape as the older backend:
+
+```text
+POST http://127.0.0.1:8080/api/passport-face-match/verify
+```
+
+```json
+{
+  "api_key": "...",
+  "passport_face_base64": "...",
+  "passport_face_file_name": "passport_face.jpg",
+  "uploaded_face_base64": "...",
+  "uploaded_face_file_name": "uploaded_face.jpg"
+}
+```
+
+Batch face/passport matching accepts a list of base64 images. The API classifies each image, reads MRZ for passport pages, matches faces to passports, and returns only paired objects:
+
+```text
+POST http://127.0.0.1:8080/api/passport-face-match/batch
+```
+
+```json
+{
+  "api_key": "...",
+  "items": [
+    { "file_name": "face_001.jpg", "base64": "..." },
+    { "file_name": "passport_001.jpg", "base64": "..." }
+  ]
+}
+```
+
+```json
+{
+  "data": [
+    {
+      "face": { "file_name": "face_001.jpg", "base64": "..." },
+      "passport": {
+        "file_name": "passport_001.jpg",
+        "base64": "...",
+        "face_base64": "...",
+        "match": { "score": 0.72, "decision": "match" },
+        "mrz": {
+          "found": true,
+          "confidence": 0.88,
+          "lines": [
+            { "text": "P<VNM...", "confidence": 0.91 }
+          ]
+        },
+        "parsed": {
+          "passport_no": "B1234567",
+          "full_name": "NGUYEN VAN A",
+          "date_of_birth": "1990-01-01",
+          "sex": "M",
+          "nationality": "VNM",
+          "expiry_date": "2030-01-01"
+        }
+      }
+    }
+  ]
+}
+```
+
+Unmatched input is still returned as `{ "face": {...}, "passport": null }` or `{ "face": null, "passport": {...} }`.
+
 The API also accepts data URLs:
 
 ```json

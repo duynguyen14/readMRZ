@@ -46,6 +46,7 @@ class Config:
     input_dir: Path
     output_dir: Path
     batch_size: int
+    max_image_side: int
     document_type: str
     limit: int
     overwrite: bool
@@ -115,6 +116,7 @@ def load_config(env: dict[str, str]) -> Config:
         input_dir=input_dir.resolve(),
         output_dir=output_dir.resolve(),
         batch_size=max(1, env_int(env, "READMRZ_VN_VISA_BATCH_SIZE", 1)),
+        max_image_side=max(0, env_int(env, "READMRZ_VN_VISA_MAX_IMAGE_SIDE", 1600)),
         document_type=document_type,
         limit=max(0, env_int(env, "READMRZ_VN_VISA_LIMIT", 0)),
         overwrite=env_bool(env, "READMRZ_VN_VISA_OVERWRITE", False),
@@ -175,7 +177,7 @@ class PaddleVisaOcr:
             "use_doc_unwarping": env_bool(env, "READMRZ_VN_VISA_PADDLE_DOC_UNWARPING", False),
             "use_textline_orientation": env_bool(env, "PADDLE_USE_TEXTLINE_ORIENTATION", True),
             "return_word_box": True,
-            "det_limit_side_len": env_int(env, "PADDLE_DET_LIMIT_SIDE_LEN", 1280),
+            "text_det_limit_side_len": env_int(env, "PADDLE_TEXT_DET_LIMIT_SIDE_LEN", 1280),
         }
 
         model_dir_map = {
@@ -239,6 +241,32 @@ def imwrite(path: Path, image: np.ndarray) -> None:
     if not success:
         raise RuntimeError(f"Failed to encode image: {path}")
     encoded.tofile(str(path))
+
+
+def resize_to_max_side(image: np.ndarray, max_side: int) -> tuple[np.ndarray, dict[str, Any]]:
+    height, width = image.shape[:2]
+    if max_side <= 0 or max(height, width) <= max_side:
+        return image, {
+            "enabled": False,
+            "original_width": width,
+            "original_height": height,
+            "output_width": width,
+            "output_height": height,
+            "scale": 1.0,
+        }
+
+    scale = max_side / float(max(height, width))
+    output_width = max(1, int(round(width * scale)))
+    output_height = max(1, int(round(height * scale)))
+    resized = cv2.resize(image, (output_width, output_height), interpolation=cv2.INTER_AREA)
+    return resized, {
+        "enabled": True,
+        "original_width": width,
+        "original_height": height,
+        "output_width": output_width,
+        "output_height": output_height,
+        "scale": round(scale, 8),
+    }
 
 
 def file_sha256(path: Path, chunk_size: int = 1024 * 1024) -> str:
@@ -835,13 +863,18 @@ def process_one(
     data_json: dict[str, Any] | None = None
     status = "error"
     review_status = "needs_review"
+    image_started = time.perf_counter()
 
     try:
         image = imread(image_path)
         if image is None:
             raise RuntimeError("Cannot read image")
 
+        image, resize_payload = resize_to_max_side(image, config.max_image_side)
         normalized_image, orientation_payload = orientation.normalize(image)
+        if orientation_payload is None:
+            orientation_payload = {}
+        orientation_payload["pre_ocr_resize"] = resize_payload
         image_height, image_width = normalized_image.shape[:2]
 
         output_path = config.output_dir / Path(relative_image_path)
@@ -862,6 +895,12 @@ def process_one(
     except Exception as exc:
         error_message = str(exc)[:2000]
         processed_at = time.strftime("%Y-%m-%d %H:%M:%S")
+
+    elapsed_ms = int((time.perf_counter() - image_started) * 1000)
+    if data_json is not None:
+        data_json["elapsed_ms"] = elapsed_ms
+    if orientation_payload is not None:
+        orientation_payload["total_image_elapsed_ms"] = elapsed_ms
 
     stat = image_path.stat()
     return {

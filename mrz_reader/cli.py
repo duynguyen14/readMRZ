@@ -6,6 +6,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
 import sys
+import threading
 import time
 from urllib.parse import parse_qs, urlparse
 
@@ -46,13 +47,48 @@ from .vn_visa_review import (
 from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .env_config import env_value, read_env_file
+from .face_match import FaceMatchService
 from .file_type_classifier import FileTypeClassifier
+from .passport_face_batch import process_batch
 from .yolo_detector import YoloMrzDetector
 from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
 
 LOG_PATH = Path(__file__).resolve().parents[1] / "readmrz-api.log"
 EXTERNAL_API_KEY = "9148fca3-187c-46d1-95d5-5c8c4b8ea1ad"
+
+
+class LimitedThreadingHTTPServer(ThreadingHTTPServer):
+    daemon_threads = True
+
+    def __init__(self, server_address, request_handler_class, *, max_workers: int) -> None:
+        super().__init__(server_address, request_handler_class)
+        self._connection_limit = threading.BoundedSemaphore(max(1, int(max_workers)))
+
+    def process_request(self, request, client_address) -> None:
+        if not self._connection_limit.acquire(blocking=False):
+            try:
+                request.sendall(
+                    b"HTTP/1.1 503 Service Unavailable\r\n"
+                    b"Connection: close\r\n"
+                    b"Content-Type: application/json\r\n"
+                    b"Content-Length: 38\r\n\r\n"
+                    b'{"error":"Server is busy. Try later."}'
+                )
+            finally:
+                self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            self._connection_limit.release()
+            raise
+
+    def process_request_thread(self, request, client_address) -> None:
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._connection_limit.release()
 
 
 def log_api(message: str) -> None:
@@ -156,11 +192,41 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         f"yolo={yolo_cpu_threads} orientation={orientation_cpu_threads} "
         f"ocr={ocr_cpu_threads} opencv={cv2.getNumThreads()}"
     )
+    max_request_bytes = max(
+        1024,
+        int(env_value(server_env, "READMRZ_API_MAX_REQUEST_BYTES", str(50 * 1024 * 1024))),
+    )
+    inference_concurrency = max(
+        1,
+        int(env_value(server_env, "READMRZ_API_INFERENCE_CONCURRENCY", "1")),
+    )
+    inference_queue_timeout = max(
+        1,
+        int(env_value(server_env, "READMRZ_API_QUEUE_TIMEOUT_SECONDS", "120")),
+    )
+    max_http_threads = max(
+        inference_concurrency,
+        int(env_value(server_env, "READMRZ_API_MAX_HTTP_THREADS", "8")),
+    )
+    inference_limit = threading.Semaphore(inference_concurrency)
+    api_key = (
+        env_value(server_env, "READMRZ_API_KEY", "").strip()
+        or env_value(server_env, "PASSPORT_INFERENCE_API_KEY", "").strip()
+        or env_value(server_env, "API_KEY", "").strip()
+    )
+    log_api(
+        "API limits "
+        f"inference_concurrency={inference_concurrency} "
+        f"queue_timeout_seconds={inference_queue_timeout} "
+        f"max_http_threads={max_http_threads} "
+        f"max_request_bytes={max_request_bytes}"
+    )
     engine: MrzOcrEngine | None = None
     yolo_detector: YoloMrzDetector | None = None
     document_orientation: PaddleDocumentOrientation | None = None
     custom_mrz_ocr: CustomMrzCtcRecognizer | None = None
     file_type_classifier: FileTypeClassifier | None = None
+    face_matcher: FaceMatchService | None = None
 
     def get_engine() -> MrzOcrEngine:
         nonlocal engine
@@ -211,6 +277,17 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             )
         return file_type_classifier
 
+    def get_face_matcher() -> FaceMatchService:
+        nonlocal face_matcher
+        if face_matcher is None:
+            log_api("Loading face match service")
+            face_matcher = FaceMatchService()
+            log_api(
+                "Loaded face match service "
+                f"model_load_ms={face_matcher.load_ms} device={face_matcher.device}"
+            )
+        return face_matcher
+
     if env_bool(server_env, "READMRZ_API_PRELOAD_MODELS", True):
         preload_started = time.perf_counter()
         log_api("Preloading upload pipeline models")
@@ -243,6 +320,24 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             warmup_ms = classifier_model.warmup()
             log_api(f"Warmed file type classifier warmup_ms={warmup_ms}")
 
+    if env_bool(server_env, "READMRZ_FACE_MATCH_PRELOAD", False):
+        preload_started = time.perf_counter()
+        face_match_model = get_face_matcher()
+        log_api(
+            "Preloaded face match service "
+            f"total_ms={int((time.perf_counter() - preload_started) * 1000)}"
+        )
+        if env_bool(server_env, "READMRZ_FACE_MATCH_WARMUP", False):
+            warmup_ms = face_match_model.warmup()
+            log_api(f"Warmed face match service warmup_ms={warmup_ms}")
+
+    def validate_configured_api_key(payload: dict) -> None:
+        if not api_key:
+            raise PermissionError("READMRZ_API_KEY is not configured")
+        provided = str(payload.get("api_key") or payload.get("key") or "").strip()
+        if provided != api_key:
+            raise PermissionError("Invalid API key")
+
     class Handler(BaseHTTPRequestHandler):
         def log_message(self, format: str, *args) -> None:
             return
@@ -257,6 +352,23 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
+
+        def read_json_body(self) -> dict:
+            content_type = self.headers.get("Content-Type", "")
+            if "application/json" not in content_type.lower():
+                raise ValueError("Content-Type must be application/json")
+            length = int(self.headers.get("Content-Length", "0"))
+            if length <= 0:
+                return {}
+            if length > max_request_bytes:
+                raise ValueError(
+                    f"Request body is too large. Max allowed is {max_request_bytes} bytes."
+                )
+            data = self.rfile.read(length)
+            return json.loads(data.decode("utf-8")) if data else {}
+
+        def acquire_inference_slot(self) -> bool:
+            return inference_limit.acquire(timeout=inference_queue_timeout)
 
         def do_OPTIONS(self) -> None:
             log_api(f"OPTIONS {self.path}")
@@ -273,6 +385,16 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             parsed_url = urlparse(self.path)
             if parsed_url.path == "/health":
                 self.send_json(200, {"ok": True, "engine": "readmrz"})
+                return
+            if parsed_url.path in {
+                "/passport-face-match/runtime",
+                "/api/passport-face-match/runtime",
+            }:
+                try:
+                    self.send_json(200, {"status": "success", "data": get_face_matcher().runtime_info()})
+                except Exception as exc:
+                    log_api(f"FACE_MATCH_RUNTIME error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
                 return
             if parsed_url.path == "/label-review/next":
                 params = parse_qs(parsed_url.query)
@@ -477,6 +599,95 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 return
 
+            if parsed_url.path in {
+                "/passport-face-match/verify",
+                "/api/passport-face-match/verify",
+            }:
+                acquired = False
+                try:
+                    request_started = time.perf_counter()
+                    acquired = self.acquire_inference_slot()
+                    if not acquired:
+                        self.send_json(
+                            503,
+                            {
+                                "status": "error",
+                                "error": "Server is busy. Try again later.",
+                            },
+                        )
+                        return
+                    request_payload = self.read_json_body()
+                    validate_configured_api_key(request_payload)
+                    result = get_face_matcher().verify_base64_pair(
+                        passport_face_base64=str(request_payload.get("passport_face_base64") or ""),
+                        passport_face_file_name=str(
+                            request_payload.get("passport_face_file_name") or "passport_face.jpg"
+                        ),
+                        uploaded_face_base64=str(request_payload.get("uploaded_face_base64") or ""),
+                        uploaded_face_file_name=str(
+                            request_payload.get("uploaded_face_file_name") or "uploaded_face.jpg"
+                        ),
+                    )
+                    log_api(
+                        "PASSPORT_FACE_MATCH_VERIFY done "
+                        f"decision={result.get('decision')} score={result.get('score')} "
+                        f"latency_ms={int((time.perf_counter() - request_started) * 1000)}"
+                    )
+                    self.send_json(200, {"status": "success", "data": result})
+                except PermissionError as exc:
+                    log_api(f"PASSPORT_FACE_MATCH_VERIFY auth_error {exc}")
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_FACE_MATCH_VERIFY error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                finally:
+                    if acquired:
+                        inference_limit.release()
+                return
+
+            if parsed_url.path in {
+                "/passport-face-match/batch",
+                "/passport-face-match/verify-batch",
+                "/api/passport-face-match/batch",
+                "/api/passport-face-match/verify-batch",
+            }:
+                acquired = False
+                try:
+                    request_started = time.perf_counter()
+                    acquired = self.acquire_inference_slot()
+                    if not acquired:
+                        self.send_json(503, {"error": "Server is busy. Try again later."})
+                        return
+                    request_payload = self.read_json_body()
+                    validate_configured_api_key(request_payload)
+                    raw_items = request_payload.get("items") or request_payload.get("data") or []
+                    if not isinstance(raw_items, list):
+                        raise ValueError("items must be a list")
+                    result = process_batch(
+                        raw_items,
+                        classifier=get_file_type_classifier(),
+                        face_matcher=get_face_matcher(),
+                        yolo_detector=get_yolo_detector(),
+                        orientation=get_document_orientation(),
+                        recognizer=get_custom_mrz_ocr(),
+                    )
+                    log_api(
+                        "PASSPORT_FACE_MATCH_BATCH done "
+                        f"items={len(raw_items)} pairs={len(result.get('data') or [])} "
+                        f"latency_ms={int((time.perf_counter() - request_started) * 1000)}"
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    log_api(f"PASSPORT_FACE_MATCH_BATCH auth_error {exc}")
+                    self.send_json(401, {"error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_FACE_MATCH_BATCH error {exc}")
+                    self.send_json(400, {"error": str(exc), "data": []})
+                finally:
+                    if acquired:
+                        inference_limit.release()
+                return
+
             if parsed_url.path == "/yolo-mrz-read-base64":
                 try:
                     request_started = time.perf_counter()
@@ -675,7 +886,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 log_api(f"READ error {exc}")
                 self.send_json(400, {"found": False, "confidence": 0.0, "error": str(exc)})
 
-    server = ThreadingHTTPServer((host, port), Handler)
+    server = LimitedThreadingHTTPServer((host, port), Handler, max_workers=max_http_threads)
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     log_api(f"READMRZ server listening on http://{display_host}:{port} bind={host}:{port}")
     log_api("POST JSON {\"image_base64\":\"...\"} to /read")

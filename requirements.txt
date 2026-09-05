@@ -6,4 +6,5 @@ paddlepaddle
 paddleocr
 paddlex
 pyodbc
+PyYAML
 ultralytics

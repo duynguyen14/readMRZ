@@ -1,0 +1,11 @@
+.git
+.idea
+.venv
+__pycache__
+*.pyc
+*.log
+build
+dist
+datasets
+generated_datasets
+tmp_debug
