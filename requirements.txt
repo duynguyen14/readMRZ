@@ -8,3 +8,4 @@ paddlex
 pyodbc
 PyYAML
 ultralytics
+insightface

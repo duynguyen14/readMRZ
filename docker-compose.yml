@@ -21,9 +21,16 @@ services:
       PADDLE_TEXT_RECOGNITION_MODEL_DIR: /app/models/paddle/en_PP-OCRv5_mobile_rec
       READMRZ_PADDLE_PYTHON: ""
       READMRZ_FILE_DETECT_MODEL_PATH: /app/models/file_type_classifier
-      FACE_MATCH_MODEL_DIR: /app/models/opencv_face
-      FACE_MATCH_DETECTOR_MODEL_PATH: /app/models/opencv_face/face_detection_yunet_2023mar.onnx
-      FACE_MATCH_RECOGNIZER_MODEL_PATH: /app/models/opencv_face/face_recognition_sface_2021dec.onnx
+      INSIGHTFACE_MODEL_NAME: buffalo_l
+      INSIGHTFACE_MODEL_ROOT: /app/models/insightface
+      INSIGHTFACE_PROVIDERS: CPUExecutionProvider
+      INSIGHTFACE_CTX_ID: "-1"
+      INSIGHTFACE_DET_WIDTH: "640"
+      INSIGHTFACE_DET_HEIGHT: "640"
+      INSIGHTFACE_DETECT_SCORE_THRESHOLD: "0.5"
+      READMRZ_FACE_MATCH_MAX_DETECTIONS_PER_IMAGE: "5"
+      INSIGHTFACE_MATCH_THRESHOLD: "0.45"
+      INSIGHTFACE_REVIEW_THRESHOLD: "0.35"
       FACE_MATCH_PREFER_CUDA: "false"
       OMP_NUM_THREADS: "${READMRZ_OPENCV_CPU_THREADS:-2}"
       MKL_NUM_THREADS: "${READMRZ_OPENCV_CPU_THREADS:-2}"

@@ -51,7 +51,7 @@ $body = @{ image_base64 = $b64; filename = "passport.jpg" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/read -Body $body -ContentType "application/json"
 ```
 
-Face match 1-1 keeps the same request/response shape as the older backend:
+Face match uses InsightFace model packs: SCRFD for face detection and ArcFace for recognition. Face match 1-1 keeps the same request/response shape as the older backend:
 
 ```text
 POST http://127.0.0.1:8080/api/passport-face-match/verify
