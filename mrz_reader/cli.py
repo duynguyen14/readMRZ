@@ -670,6 +670,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                         yolo_detector=get_yolo_detector(),
                         orientation=get_document_orientation(),
                         recognizer=get_custom_mrz_ocr(),
+                        logger=log_api,
                     )
                     log_api(
                         "PASSPORT_FACE_MATCH_BATCH done "

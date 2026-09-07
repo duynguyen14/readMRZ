@@ -2,7 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from time import perf_counter
-from typing import Any
+from typing import Any, Callable
 
 import numpy as np
 
@@ -54,6 +54,7 @@ def process_batch(
     yolo_detector: YoloMrzDetector,
     orientation: PaddleDocumentOrientation,
     recognizer: CustomMrzCtcRecognizer,
+    logger: Callable[[str], None] | None = None,
 ) -> dict[str, Any]:
     env = read_env_file()
     max_items = max(1, int(env_value(env, "READMRZ_BATCH_MAX_ITEMS", "20")))
@@ -61,17 +62,33 @@ def process_batch(
         raise ValueError(f"Too many items. Max allowed is {max_items}.")
 
     max_side = max(0, int(env_value(env, "READMRZ_INFERENCE_MAX_IMAGE_SIDE", "1600")))
+    log_batch(
+        logger,
+        "PASSPORT_FACE_MATCH_BATCH detail_start "
+        f"items={len(items)} max_side={max_side} "
+        f"match_threshold={face_matcher.match_threshold} "
+        f"review_threshold={face_matcher.review_threshold}",
+    )
     faces: list[FaceCandidate] = []
     passports: list[PassportCandidate] = []
 
-    for raw_item in items:
+    for item_index, raw_item in enumerate(items, start=1):
         input_item = normalize_input_item(raw_item)
         payload = decode_base64_image_payload(input_item.base64_value, input_item.file_name)
         working = resize_for_inference(payload.image, max_side)
         classification = classifier.predict(working.image)
         label = normalize_class_label(classification.get("label"))
+        log_batch(
+            logger,
+            "PASSPORT_FACE_MATCH_BATCH item_classified "
+            f"index={item_index} file={payload.file_name} "
+            f"class={label or 'unknown'} "
+            f"class_raw={classification.get('label') or ''} "
+            f"class_conf={round(float(classification.get('confidence') or 0.0), 6)} "
+            f"size={payload.width}x{payload.height} resized={working.resized}",
+        )
         if label == "face":
-            faces.append(build_face_candidate(payload, working, classification, face_matcher))
+            faces.append(build_face_candidate(payload, working, classification, face_matcher, logger))
         elif label == "passport":
             passports.append(
                 build_passport_candidate(
@@ -82,10 +99,23 @@ def process_batch(
                     yolo_detector,
                     orientation,
                     recognizer,
+                    logger,
                 )
             )
+        else:
+            log_batch(
+                logger,
+                "PASSPORT_FACE_MATCH_BATCH item_ignored "
+                f"index={item_index} file={payload.file_name} class={label or 'unknown'}",
+            )
 
-    return {"data": pair_candidates(faces, passports, face_matcher)}
+    data = pair_candidates(faces, passports, face_matcher, logger)
+    log_batch(
+        logger,
+        "PASSPORT_FACE_MATCH_BATCH detail_done "
+        f"faces={len(faces)} passports={len(passports)} rows={len(data)}",
+    )
+    return {"data": data}
 
 
 def normalize_class_label(value: Any) -> str:
@@ -112,6 +142,7 @@ def build_face_candidate(
     working: WorkingImage,
     classification: dict[str, Any],
     face_matcher: FaceMatchService,
+    logger: Callable[[str], None] | None = None,
 ) -> FaceCandidate:
     face_row, detect_meta = face_matcher.detect_primary_face(working.image)
     response = {
@@ -136,6 +167,15 @@ def build_face_candidate(
     embedding = None
     if face_row is not None:
         embedding, _ = face_matcher.extract_embedding(working.image, face_row)
+    log_batch(
+        logger,
+        "PASSPORT_FACE_MATCH_BATCH face_ready "
+        f"file={payload.file_name} detected={face_row is not None} "
+        f"face_count={int(detect_meta['count'])} "
+        f"face_conf={response['face_confidence']} "
+        f"embedding={embedding is not None} "
+        f"detect_ms={detect_meta['duration_ms']}",
+    )
     return FaceCandidate(payload=payload, working=working, response=response, embedding=embedding)
 
 
@@ -147,6 +187,7 @@ def build_passport_candidate(
     yolo_detector: YoloMrzDetector,
     orientation: PaddleDocumentOrientation,
     recognizer: CustomMrzCtcRecognizer,
+    logger: Callable[[str], None] | None = None,
 ) -> PassportCandidate:
     started = perf_counter()
     mrz_payload = process_yolo_upload(
@@ -193,6 +234,18 @@ def build_passport_candidate(
         "parsed": build_parsed_payload(compact_mrz),
         "processing_ms": int((perf_counter() - started) * 1000),
     }
+    log_batch(
+        logger,
+        "PASSPORT_FACE_MATCH_BATCH passport_ready "
+        f"file={payload.file_name} face_detected={face_row is not None} "
+        f"face_count={int(detect_meta['count'])} "
+        f"face_conf={response['face_confidence']} "
+        f"embedding={embedding is not None} "
+        f"mrz_found={response['mrz']['found']} "
+        f"mrz_conf={response['mrz']['confidence']} "
+        f"detect_ms={detect_meta['duration_ms']} "
+        f"processing_ms={response['processing_ms']}",
+    )
     return PassportCandidate(payload=payload, working=working, response=response, embedding=embedding)
 
 
@@ -254,16 +307,33 @@ def pair_candidates(
     faces: list[FaceCandidate],
     passports: list[PassportCandidate],
     face_matcher: FaceMatchService,
+    logger: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
     pairs: list[tuple[float, int, int, dict[str, Any]]] = []
     for face_index, face in enumerate(faces):
         if face.embedding is None:
+            log_batch(
+                logger,
+                "PASSPORT_FACE_MATCH_BATCH face_skip_no_embedding "
+                f"file={face.payload.file_name}",
+            )
             continue
         for passport_index, passport in enumerate(passports):
             if passport.embedding is None:
+                log_batch(
+                    logger,
+                    "PASSPORT_FACE_MATCH_BATCH compare_skip_no_passport_embedding "
+                    f"face={face.payload.file_name} passport={passport.payload.file_name}",
+                )
                 continue
             score = face_matcher.match_embeddings(face.embedding, passport.embedding)
             decision, matched, review_required = face_matcher.decision(score)
+            log_batch(
+                logger,
+                "PASSPORT_FACE_MATCH_BATCH compare "
+                f"face={face.payload.file_name} passport={passport.payload.file_name} "
+                f"score={round(score, 6)} decision={decision}",
+            )
             if decision == "mismatch":
                 continue
             pairs.append(
@@ -292,17 +362,41 @@ def pair_candidates(
         passport_payload = dict(passport.response)
         passport_payload["match"] = match_payload
         data.append({"face": face.response, "passport": passport_payload})
+        log_batch(
+            logger,
+            "PASSPORT_FACE_MATCH_BATCH pair_selected "
+            f"face={face.payload.file_name} passport={passport.payload.file_name} "
+            f"score={match_payload['score']} decision={match_payload['decision']}",
+        )
         used_faces.add(face_index)
         used_passports.add(passport_index)
 
     for face_index, face in enumerate(faces):
         if face_index not in used_faces:
             data.append({"face": face.response, "passport": None})
+            log_batch(
+                logger,
+                "PASSPORT_FACE_MATCH_BATCH unmatched_face "
+                f"file={face.payload.file_name} detected={face.response.get('detected')} "
+                f"face_conf={face.response.get('face_confidence')}",
+            )
 
     for passport_index, passport in enumerate(passports):
         if passport_index not in used_passports:
             passport_payload = dict(passport.response)
             passport_payload["match"] = None
             data.append({"face": None, "passport": passport_payload})
+            log_batch(
+                logger,
+                "PASSPORT_FACE_MATCH_BATCH unmatched_passport "
+                f"file={passport.payload.file_name} "
+                f"face_conf={passport.response.get('face_confidence')} "
+                f"mrz_found={(passport.response.get('mrz') or {}).get('found')}",
+            )
 
     return data
+
+
+def log_batch(logger: Callable[[str], None] | None, message: str) -> None:
+    if logger is not None:
+        logger(message)
