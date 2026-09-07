@@ -131,6 +131,10 @@ class FaceMatchService:
         return int((perf_counter() - started) * 1000)
 
     def detect_primary_face(self, image: np.ndarray) -> tuple[np.ndarray | None, dict[str, Any]]:
+        face_rows, meta = self.detect_faces(image)
+        return select_primary_face(face_rows), meta
+
+    def detect_faces(self, image: np.ndarray) -> tuple[list[np.ndarray], dict[str, Any]]:
         if image is None or image.size == 0:
             raise ValueError("image is empty")
         started = perf_counter()
@@ -140,7 +144,7 @@ class FaceMatchService:
             _, faces = self.detector.detect(image)
         duration_ms = round((perf_counter() - started) * 1000, 2)
         face_rows = [] if faces is None else [face for face in faces]
-        return select_primary_face(face_rows), {
+        return face_rows, {
             "count": len(face_rows),
             "duration_ms": duration_ms,
         }

@@ -31,11 +31,20 @@ class InputItem:
 
 
 @dataclass
+class DetectedFace:
+    embedding: np.ndarray
+    bbox: dict[str, float]
+    confidence: float
+    aligned_face_content_type: str
+    aligned_face_base64: str
+
+
+@dataclass
 class FaceCandidate:
     payload: ImagePayload
     working: WorkingImage
     response: dict[str, Any]
-    embedding: np.ndarray | None
+    detections: list[DetectedFace]
 
 
 @dataclass
@@ -43,7 +52,7 @@ class PassportCandidate:
     payload: ImagePayload
     working: WorkingImage
     response: dict[str, Any]
-    embedding: np.ndarray | None
+    detections: list[DetectedFace]
 
 
 def process_batch(
@@ -144,7 +153,8 @@ def build_face_candidate(
     face_matcher: FaceMatchService,
     logger: Callable[[str], None] | None = None,
 ) -> FaceCandidate:
-    face_row, detect_meta = face_matcher.detect_primary_face(working.image)
+    detections, detect_meta = build_detected_faces(payload, working, face_matcher)
+    primary = detections[0] if detections else None
     response = {
         "file_name": payload.file_name,
         "content_type": payload.content_type,
@@ -155,28 +165,21 @@ def build_face_candidate(
             "height": payload.height,
             "resized_for_inference": working.resized,
         },
-        "detected": face_row is not None,
+        "detected": primary is not None,
         "face_count": int(detect_meta["count"]),
-        "face_bbox": (
-            map_bbox_to_original(face_bbox(face_row), working, payload.width, payload.height)
-            if face_row is not None
-            else None
-        ),
-        "face_confidence": face_confidence(face_row) if face_row is not None else 0.0,
+        "face_bbox": primary.bbox if primary is not None else None,
+        "face_confidence": primary.confidence if primary is not None else 0.0,
     }
-    embedding = None
-    if face_row is not None:
-        embedding, _ = face_matcher.extract_embedding(working.image, face_row)
     log_batch(
         logger,
         "PASSPORT_FACE_MATCH_BATCH face_ready "
-        f"file={payload.file_name} detected={face_row is not None} "
+        f"file={payload.file_name} detected={primary is not None} "
         f"face_count={int(detect_meta['count'])} "
         f"face_conf={response['face_confidence']} "
-        f"embedding={embedding is not None} "
+        f"embeddings={len(detections)} "
         f"detect_ms={detect_meta['duration_ms']}",
     )
-    return FaceCandidate(payload=payload, working=working, response=response, embedding=embedding)
+    return FaceCandidate(payload=payload, working=working, response=response, detections=detections)
 
 
 def build_passport_candidate(
@@ -198,19 +201,14 @@ def build_passport_candidate(
         include_images=False,
     )
     compact_mrz = compact_yolo_read_payload(mrz_payload)
-    face_row, detect_meta = face_matcher.detect_primary_face(working.image)
+    detections, detect_meta = build_detected_faces(payload, working, face_matcher, include_aligned=True)
+    primary = detections[0] if detections else None
 
     face_base64 = ""
     face_content_type = ""
-    embedding = None
-    if face_row is not None:
-        embedding, face_meta = face_matcher.extract_embedding(working.image, face_row)
-        face_base64 = str(face_meta.get("aligned_face_base64") or "")
-        face_content_type = str(face_meta.get("aligned_face_content_type") or "")
-        if not face_base64:
-            crop = crop_bbox(working.image, face_bbox(face_row), padding_ratio=0.2)
-            if crop is not None:
-                face_content_type, face_base64 = encode_jpeg_base64(crop)
+    if primary is not None:
+        face_base64 = primary.aligned_face_base64
+        face_content_type = primary.aligned_face_content_type
 
     response = {
         "file_name": payload.file_name,
@@ -224,12 +222,8 @@ def build_passport_candidate(
         },
         "face_base64": face_base64,
         "face_content_type": face_content_type,
-        "face_bbox": (
-            map_bbox_to_original(face_bbox(face_row), working, payload.width, payload.height)
-            if face_row is not None
-            else None
-        ),
-        "face_confidence": face_confidence(face_row) if face_row is not None else 0.0,
+        "face_bbox": primary.bbox if primary is not None else None,
+        "face_confidence": primary.confidence if primary is not None else 0.0,
         "mrz": build_mrz_payload(compact_mrz),
         "parsed": build_parsed_payload(compact_mrz),
         "processing_ms": int((perf_counter() - started) * 1000),
@@ -237,16 +231,50 @@ def build_passport_candidate(
     log_batch(
         logger,
         "PASSPORT_FACE_MATCH_BATCH passport_ready "
-        f"file={payload.file_name} face_detected={face_row is not None} "
+        f"file={payload.file_name} face_detected={primary is not None} "
         f"face_count={int(detect_meta['count'])} "
         f"face_conf={response['face_confidence']} "
-        f"embedding={embedding is not None} "
+        f"embeddings={len(detections)} "
         f"mrz_found={response['mrz']['found']} "
         f"mrz_conf={response['mrz']['confidence']} "
         f"detect_ms={detect_meta['duration_ms']} "
         f"processing_ms={response['processing_ms']}",
     )
-    return PassportCandidate(payload=payload, working=working, response=response, embedding=embedding)
+    return PassportCandidate(payload=payload, working=working, response=response, detections=detections)
+
+
+def build_detected_faces(
+    payload: ImagePayload,
+    working: WorkingImage,
+    face_matcher: FaceMatchService,
+    *,
+    include_aligned: bool = False,
+) -> tuple[list[DetectedFace], dict[str, Any]]:
+    env = read_env_file()
+    max_detections = max(1, int(env_value(env, "READMRZ_FACE_MATCH_MAX_DETECTIONS_PER_IMAGE", "5")))
+    face_rows, detect_meta = face_matcher.detect_faces(working.image)
+    face_rows = sorted(face_rows, key=face_confidence, reverse=True)[:max_detections]
+
+    detections: list[DetectedFace] = []
+    for face_row in face_rows:
+        embedding, face_meta = face_matcher.extract_embedding(working.image, face_row)
+        aligned_base64 = str(face_meta.get("aligned_face_base64") or "")
+        aligned_content_type = str(face_meta.get("aligned_face_content_type") or "")
+        if include_aligned and not aligned_base64:
+            crop = crop_bbox(working.image, face_bbox(face_row), padding_ratio=0.2)
+            if crop is not None:
+                aligned_content_type, aligned_base64 = encode_jpeg_base64(crop)
+
+        detections.append(
+            DetectedFace(
+                embedding=embedding,
+                bbox=map_bbox_to_original(face_bbox(face_row), working, payload.width, payload.height),
+                confidence=face_confidence(face_row),
+                aligned_face_content_type=aligned_content_type if include_aligned else "",
+                aligned_face_base64=aligned_base64 if include_aligned else "",
+            )
+        )
+    return detections, detect_meta
 
 
 def build_classification_payload(payload: dict[str, Any]) -> dict[str, Any]:
@@ -309,63 +337,72 @@ def pair_candidates(
     face_matcher: FaceMatchService,
     logger: Callable[[str], None] | None = None,
 ) -> list[dict[str, Any]]:
-    pairs: list[tuple[float, int, int, dict[str, Any]]] = []
+    pairs: list[tuple[float, int, int, int, int, dict[str, Any]]] = []
     for face_index, face in enumerate(faces):
-        if face.embedding is None:
+        if not face.detections:
             log_batch(
                 logger,
                 "PASSPORT_FACE_MATCH_BATCH face_skip_no_embedding "
                 f"file={face.payload.file_name}",
             )
             continue
-        for passport_index, passport in enumerate(passports):
-            if passport.embedding is None:
-                log_batch(
-                    logger,
-                    "PASSPORT_FACE_MATCH_BATCH compare_skip_no_passport_embedding "
-                    f"face={face.payload.file_name} passport={passport.payload.file_name}",
-                )
-                continue
-            score = face_matcher.match_embeddings(face.embedding, passport.embedding)
-            decision, matched, review_required = face_matcher.decision(score)
-            log_batch(
-                logger,
-                "PASSPORT_FACE_MATCH_BATCH compare "
-                f"face={face.payload.file_name} passport={passport.payload.file_name} "
-                f"score={round(score, 6)} decision={decision}",
-            )
-            if decision == "mismatch":
-                continue
-            pairs.append(
-                (
-                    score,
-                    face_index,
-                    passport_index,
-                    {
-                        "score": round(score, 6),
-                        "decision": decision,
-                        "matched": matched,
-                        "review_required": review_required,
-                    },
-                )
-            )
+        for face_detection_index, face_detection in enumerate(face.detections):
+            for passport_index, passport in enumerate(passports):
+                if not passport.detections:
+                    log_batch(
+                        logger,
+                        "PASSPORT_FACE_MATCH_BATCH compare_skip_no_passport_embedding "
+                        f"face={face.payload.file_name} passport={passport.payload.file_name}",
+                    )
+                    continue
+                for passport_detection_index, passport_detection in enumerate(passport.detections):
+                    score = face_matcher.match_embeddings(face_detection.embedding, passport_detection.embedding)
+                    decision, matched, review_required = face_matcher.decision(score)
+                    log_batch(
+                        logger,
+                        "PASSPORT_FACE_MATCH_BATCH compare "
+                        f"face={face.payload.file_name} face_det={face_detection_index} "
+                        f"face_conf={face_detection.confidence} "
+                        f"passport={passport.payload.file_name} pass_det={passport_detection_index} "
+                        f"pass_conf={passport_detection.confidence} "
+                        f"score={round(score, 6)} decision={decision}",
+                    )
+                    if decision == "mismatch":
+                        continue
+                    pairs.append(
+                        (
+                            score,
+                            face_index,
+                            passport_index,
+                            face_detection_index,
+                            passport_detection_index,
+                            {
+                                "score": round(score, 6),
+                                "decision": decision,
+                                "matched": matched,
+                                "review_required": review_required,
+                            },
+                        )
+                    )
 
     pairs.sort(key=lambda item: item[0], reverse=True)
     used_faces: set[int] = set()
     used_passports: set[int] = set()
     data: list[dict[str, Any]] = []
-    for _, face_index, passport_index, match_payload in pairs:
+    for _, face_index, passport_index, face_detection_index, passport_detection_index, match_payload in pairs:
         if face_index in used_faces or passport_index in used_passports:
             continue
         face = faces[face_index]
         passport = passports[passport_index]
-        passport_payload = dict(passport.response)
+        face_payload = response_with_face_detection(face.response, face.detections[face_detection_index])
+        passport_payload = response_with_passport_detection(passport.response, passport.detections[passport_detection_index])
         passport_payload["match"] = match_payload
-        data.append({"face": face.response, "passport": passport_payload})
+        data.append({"face": face_payload, "passport": passport_payload})
         log_batch(
             logger,
             "PASSPORT_FACE_MATCH_BATCH pair_selected "
-            f"face={face.payload.file_name} passport={passport.payload.file_name} "
+            f"face={face.payload.file_name} face_det={face_detection_index} "
+            f"passport={passport.payload.file_name} pass_det={passport_detection_index} "
             f"score={match_payload['score']} decision={match_payload['decision']}",
         )
         used_faces.add(face_index)
@@ -395,6 +432,23 @@ def pair_candidates(
             )
 
     return data
+
+
+def response_with_face_detection(response: dict[str, Any], detection: DetectedFace) -> dict[str, Any]:
+    payload = dict(response)
+    payload["detected"] = True
+    payload["face_bbox"] = detection.bbox
+    payload["face_confidence"] = detection.confidence
+    return payload
+
+
+def response_with_passport_detection(response: dict[str, Any], detection: DetectedFace) -> dict[str, Any]:
+    payload = dict(response)
+    payload["face_bbox"] = detection.bbox
+    payload["face_confidence"] = detection.confidence
+    payload["face_content_type"] = detection.aligned_face_content_type
+    payload["face_base64"] = detection.aligned_face_base64
+    return payload
 
 
 def log_batch(logger: Callable[[str], None] | None, message: str) -> None:
