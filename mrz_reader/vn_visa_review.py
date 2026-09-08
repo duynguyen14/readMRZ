@@ -200,12 +200,19 @@ def correct_vn_visa_review_field(key: str, field_name: str, bbox_xyxy: list[floa
         if "fields" not in data_json:
             data_json["fields"] = {}
             
-        # Update or create the field
+        # Manual review labels are OCR-training targets, so keep the reviewer text
+        # as the visible raw label instead of preserving the old OCR text.
         field_data = data_json["fields"].get(field_name, {})
+        reviewed_label = normalized_value
+        previous_raw_text = field_data.get("raw_text")
+        if previous_raw_text and previous_raw_text != reviewed_label:
+            field_data.setdefault("ocr_raw_text", previous_raw_text)
         field_data["bbox"] = bbox_xyxy
-        field_data["normalized_value"] = normalized_value
-        field_data["raw_text"] = field_data.get("raw_text", normalized_value)
+        field_data["raw_text"] = reviewed_label
+        field_data["normalized_value"] = reviewed_label
+        field_data["reviewed_value"] = reviewed_label
         field_data["bbox_source"] = "manual_review"
+        field_data["value_source"] = "manual_review"
         
         data_json["fields"][field_name] = field_data
         
