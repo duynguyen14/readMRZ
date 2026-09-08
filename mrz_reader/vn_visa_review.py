@@ -55,65 +55,62 @@ def review_stats(cursor: Any) -> dict[str, int]:
     return {key: int(row.get(key) or 0) for key in ("total", "pending", "approved", "rejected")}
 
 
-def get_next_vn_visa_review_item(after_key: str = "") -> dict[str, Any]:
+def get_next_vn_visa_review_item(after_id: int = 0) -> dict[str, Any]:
     output_dir = vn_visa_output_dir()
     with connect() as connection:
         cursor = connection.cursor()
-        
-        # Determine the starting key
-        if not after_key:
+        stats = review_stats(cursor)
+
+        if after_id > 0:
             cursor.execute(
                 """
-                SELECT TOP 1 SourceKey 
-                FROM dbo.readmrz_vn_visa_items 
-                WHERE Status = 'mapped' AND ReviewStatus IN ('pending', 'needs_review')
-                ORDER BY SourceKey ASC
-                """
+                SELECT TOP 1 *
+                FROM dbo.readmrz_vn_visa_items
+                WHERE Id > ?
+                  AND Status = 'mapped'
+                  AND ReviewStatus IN ('pending', 'needs_review')
+                ORDER BY Id ASC
+                """,
+                after_id,
             )
-            row = cursor.fetchone()
-            after_key = row[0] if row else ""
+            row_data = fetch_one_dict(cursor)
+            if row_data:
+                return build_response(cursor, row_data, stats, output_dir)
 
-        stats = review_stats(cursor)
-        
-        if not after_key:
-            return {"status": "empty", "current": None, "stats": stats}
-            
         cursor.execute(
             """
             SELECT TOP 1 *
             FROM dbo.readmrz_vn_visa_items
-            WHERE SourceKey >= ?
-              AND Status = 'mapped'
+            WHERE Status = 'mapped'
               AND ReviewStatus IN ('pending', 'needs_review')
-            ORDER BY SourceKey ASC
-            """,
-            after_key,
+            ORDER BY Id ASC
+            """
         )
         row_data = fetch_one_dict(cursor)
-        
+
         if not row_data:
             return {"status": "empty", "current": None, "stats": stats}
-            
+
         return build_response(cursor, row_data, stats, output_dir)
 
 
-def get_previous_vn_visa_review_item(before_key: str = "") -> dict[str, Any]:
+def get_previous_vn_visa_review_item(before_id: int = 0) -> dict[str, Any]:
     output_dir = vn_visa_output_dir()
     with connect() as connection:
         cursor = connection.cursor()
         
-        if not before_key:
+        if before_id <= 0:
             return {"status": "empty", "current": None, "stats": review_stats(cursor)}
             
         cursor.execute(
             """
             SELECT TOP 1 *
             FROM dbo.readmrz_vn_visa_items
-            WHERE SourceKey < ?
+            WHERE Id < ?
               AND Status = 'mapped'
-            ORDER BY SourceKey DESC
+            ORDER BY Id DESC
             """,
-            before_key,
+            before_id,
         )
         row_data = fetch_one_dict(cursor)
         stats = review_stats(cursor)
@@ -151,6 +148,7 @@ def build_response(cursor: Any, row: dict[str, Any], stats: dict[str, int], outp
     return {
         "status": "ok",
         "current": {
+            "id": int(row["Id"]),
             "key": row["SourceKey"],
             "image_name": row.get("OriginalFileName") or image_path.name,
             "image_content_type": content_type,
@@ -165,25 +163,45 @@ def build_response(cursor: Any, row: dict[str, Any], stats: dict[str, int], outp
     }
 
 
-def submit_vn_visa_review_decision(key: str, decision: str) -> dict[str, Any]:
+def submit_vn_visa_review_decision(item_id: int, decision: str, key: str = "") -> dict[str, Any]:
     if decision not in {"approved", "rejected"}:
         raise ValueError("decision must be approved or rejected")
+    if item_id <= 0 and not key:
+        raise ValueError("id or key is required")
 
     with connect() as connection:
         cursor = connection.cursor()
+        if item_id > 0:
+            cursor.execute("SELECT Id, SourceKey FROM dbo.readmrz_vn_visa_items WHERE Id = ?", item_id)
+        else:
+            cursor.execute("SELECT Id, SourceKey FROM dbo.readmrz_vn_visa_items WHERE SourceKey = ?", key)
+        row = cursor.fetchone()
+        if not row:
+            raise KeyError(f"Item not found: {item_id or key}")
+        item_id = int(row[0])
+        key = str(row[1])
+
         cursor.execute(
             """
             UPDATE dbo.readmrz_vn_visa_items
             SET ReviewStatus = ?,
                 UpdatedDate = SYSDATETIME()
-            WHERE SourceKey = ?
+            WHERE Id = ?
             """,
             decision,
-            key,
+            item_id,
         )
         connection.commit()
 
-    return get_next_vn_visa_review_item(key + "\0")  # Get next item strictly greater than key
+    next_response = get_next_vn_visa_review_item(item_id)
+    return {
+        "status": "ok",
+        "decision": decision,
+        "id": item_id,
+        "key": key,
+        "next": next_response.get("current"),
+        "stats": next_response.get("stats", {}),
+    }
 
 
 def correct_vn_visa_review_field(key: str, field_name: str, bbox_xyxy: list[float], normalized_value: str) -> dict[str, Any]:

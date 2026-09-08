@@ -452,13 +452,13 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 return
             if parsed_url.path == "/vn-visa-review/next":
                 params = parse_qs(parsed_url.query)
-                after_key = params.get("after_key", [""])[0]
-                self.send_json(200, get_next_vn_visa_review_item(after_key))
+                after_id = int(params.get("after_id", ["0"])[0] or "0")
+                self.send_json(200, get_next_vn_visa_review_item(after_id))
                 return
             if parsed_url.path == "/vn-visa-review/previous":
                 params = parse_qs(parsed_url.query)
-                before_key = params.get("before_key", [""])[0]
-                self.send_json(200, get_previous_vn_visa_review_item(before_key))
+                before_id = int(params.get("before_id", ["0"])[0] or "0")
+                self.send_json(200, get_previous_vn_visa_review_item(before_id))
                 return
             self.send_json(404, {"error": "Unknown route"})
 
@@ -570,11 +570,12 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     length = int(self.headers.get("Content-Length", "0"))
                     data = self.rfile.read(length)
                     payload = json.loads(data.decode("utf-8")) if data else {}
+                    item_id = int(payload.get("id") or 0)
                     key = str(payload.get("key") or "")
                     decision = str(payload.get("decision") or "")
-                    if not key:
-                        raise ValueError("key is required")
-                    result = submit_vn_visa_review_decision(key, decision)
+                    if item_id <= 0 and not key:
+                        raise ValueError("id or key is required")
+                    result = submit_vn_visa_review_decision(item_id, decision, key)
                     self.send_json(200, result)
                 except Exception as exc:
                     log_api(f"VN_VISA_REVIEW error {exc}")
