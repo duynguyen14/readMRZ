@@ -8,12 +8,35 @@ services:
       - .env
     environment:
       READMRZ_API_HOST: 0.0.0.0
-      READMRZ_API_PORT: 8080
+      READMRZ_API_PORT: "${READMRZ_API_PORT:-8080}"
+      READMRZ_DB_DRIVER: "ODBC Driver 18 for SQL Server"
+      SQLSERVER_DRIVER: "ODBC Driver 18 for SQL Server"
       READMRZ_YOLO_DEVICE: cpu
       READMRZ_YOLO_MODEL_PATH: /app/models/mrz_yolo11n_best.pt
       READMRZ_CUSTOM_OCR_DEVICE: cpu
       READMRZ_CUSTOM_OCR_MODEL_DIR: /app/models/mrz_ocr_ctc
       READMRZ_CUSTOM_OCR_DICT_PATH: /app/models/mrz_ocr_ctc/mrz_dict.txt
+      READMRZ_YOLO_DATASET_DIR: /app/generated_datasets/mrz_yolo
+      READMRZ_YOLO_IMAGE_BASE_DIR: /app/generated_datasets/mrz_yolo/images
+      READMRZ_YOLO_LABEL_BASE_DIR: /app/generated_datasets/mrz_yolo/labels
+      READMRZ_OCR_LINE_DATASET_DIR: /app/generated_datasets/mrz_ocr_lines
+      READMRZ_OCR_LINE_IMAGE_BASE_DIR: /app/generated_datasets/mrz_ocr_lines/images
+      READMRZ_OCR_LINE2_DATASET_DIR: /app/generated_datasets/mrz_ocr_lines2
+      READMRZ_OCR_LINE2_IMAGE_BASE_DIR: /app/generated_datasets/mrz_ocr_lines2/images
+      READMRZ_OCR_LINE2_CROP_BASE_DIR: /app/generated_datasets/mrz_ocr_lines2/crops
+      READMRZ_OCR_LINE2_RAW_CROP_BASE_DIR: /app/generated_datasets/mrz_ocr_lines2/raw_crops
+      READMRZ_EVISA_LINE3_DATASET_DIR: /app/generated_datasets/mrz_ocr_lines3
+      READMRZ_EVISA_LINE3_IMAGE_BASE_DIR: /app/generated_datasets/mrz_ocr_lines3/images
+      READMRZ_EVISA_LINE3_CROP_BASE_DIR: /app/generated_datasets/mrz_ocr_lines3/crops
+      READMRZ_EVISA_LINE3_RAW_CROP_BASE_DIR: /app/generated_datasets/mrz_ocr_lines3/raw_crops
+      READMRZ_PIPELINE_TEST_OUTPUT_DIR: /app/generated_datasets/pipeline_tests
+      READMRZ_IMAGE_TYPE_DATASET_DIR: /app/generated_datasets/image_type_classifier
+      READMRZ_IMAGE_TYPE_IMAGE_BASE_DIR: /app/generated_datasets/image_type_classifier/images
+      READMRZ_VN_VISA_INPUT_DIR: /app/vn_visa_input
+      READMRZ_VN_VISA_OUTPUT_DIR: /app/vn_visa_oriented
+      READMRZ_VN_VISA_IMPORT_ROOT: /app/vn_visa_colab_export
+      READMRZ_VN_VISA_IMPORT_OCR_RESULTS_DIR: /app/vn_visa_colab_export/ocr_results
+      READMRZ_VN_VISA_IMPORT_ORIENTED_IMAGE_DIR: /app/vn_visa_colab_export/oriented_images
       PADDLE_OCR_DEVICE: cpu
       PADDLE_DOC_ORIENTATION_MODEL_DIR: /app/models/PP-LCNet_x1_0_doc_ori
       PADDLE_TEXTLINE_ORIENTATION_MODEL_DIR: /app/models/PP-LCNet_x1_0_textline_ori
@@ -36,8 +59,12 @@ services:
       MKL_NUM_THREADS: "${READMRZ_OPENCV_CPU_THREADS:-2}"
       OPENBLAS_NUM_THREADS: "${READMRZ_OPENCV_CPU_THREADS:-2}"
     ports:
-      - "8080:8080"
+      - "${READMRZ_HOST_PORT:-8080}:${READMRZ_API_PORT:-8080}"
     volumes:
-      - ./models:/app/models
-      - ./generated_datasets:/app/generated_datasets
+      - ${READMRZ_DOCKER_MODELS_DIR:-./models}:/app/models:ro
+      - ${READMRZ_DOCKER_GENERATED_DATASETS_DIR:-./generated_datasets}:/app/generated_datasets
+      - ${READMRZ_DOCKER_IMAGES_DIR:-./images}:/app/images:ro
+      - ${READMRZ_DOCKER_VN_VISA_INPUT_DIR:-./vn_visa_input}:/app/vn_visa_input:ro
+      - ${READMRZ_DOCKER_VN_VISA_ORIENTED_DIR:-./vn_visa_oriented}:/app/vn_visa_oriented:ro
+      - ${READMRZ_DOCKER_VN_VISA_COLAB_EXPORT_DIR:-./vn_visa_colab_export}:/app/vn_visa_colab_export:ro
     restart: unless-stopped
