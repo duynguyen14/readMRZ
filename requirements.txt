@@ -3,7 +3,7 @@ opencv-python-headless
 onnxruntime
 rapidocr-onnxruntime
 paddlepaddle
-paddleocr
+paddleocr>=3.0.0
 paddlex
 pyodbc
 PyYAML
