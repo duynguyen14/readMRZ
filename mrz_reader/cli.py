@@ -44,6 +44,12 @@ from .vn_visa_review import (
     submit_vn_visa_review_decision,
     correct_vn_visa_review_field,
 )
+from .vn_visa_ocr_crop_review import (
+    approve_vn_visa_ocr_crop_visa,
+    get_next_vn_visa_ocr_crop_review,
+    get_previous_vn_visa_ocr_crop_review,
+    save_vn_visa_ocr_crop_text,
+)
 from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .env_config import env_value, read_env_file
@@ -460,6 +466,16 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 before_id = int(params.get("before_id", ["0"])[0] or "0")
                 self.send_json(200, get_previous_vn_visa_review_item(before_id))
                 return
+            if parsed_url.path == "/vn-visa-ocr-crop-review/next":
+                params = parse_qs(parsed_url.query)
+                after_id = int(params.get("after_id", ["0"])[0] or "0")
+                self.send_json(200, get_next_vn_visa_ocr_crop_review(after_id))
+                return
+            if parsed_url.path == "/vn-visa-ocr-crop-review/previous":
+                params = parse_qs(parsed_url.query)
+                before_id = int(params.get("before_id", ["0"])[0] or "0")
+                self.send_json(200, get_previous_vn_visa_ocr_crop_review(before_id))
+                return
             self.send_json(404, {"error": "Unknown route"})
 
         def do_POST(self) -> None:
@@ -597,6 +613,35 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(200, result)
                 except Exception as exc:
                     log_api(f"VN_VISA_REVIEW_CORRECT_FIELD error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/vn-visa-ocr-crop-review/crop-decision":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    payload = json.loads(data.decode("utf-8")) if data else {}
+                    crop_id = int(payload.get("id") or 0)
+                    reviewed_text = str(payload.get("reviewed_text") or "")
+                    decision = str(payload.get("decision") or "approved")
+                    result = save_vn_visa_ocr_crop_text(crop_id, reviewed_text, decision)
+                    self.send_json(200, result)
+                except Exception as exc:
+                    log_api(f"VN_VISA_OCR_CROP_REVIEW error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path == "/vn-visa-ocr-crop-review/visa-decision":
+                try:
+                    length = int(self.headers.get("Content-Length", "0"))
+                    data = self.rfile.read(length)
+                    payload = json.loads(data.decode("utf-8")) if data else {}
+                    visa_item_id = int(payload.get("visa_item_id") or 0)
+                    crops = payload.get("crops") or []
+                    result = approve_vn_visa_ocr_crop_visa(visa_item_id, crops)
+                    self.send_json(200, result)
+                except Exception as exc:
+                    log_api(f"VN_VISA_OCR_CROP_REVIEW_VISA error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 return
 
