@@ -100,6 +100,99 @@ def get_previous_vn_visa_ocr_crop_review(before_id: int = 0) -> dict[str, Any]:
         return build_response(cursor, row, stats)
 
 
+def get_next_vn_visa_ocr_crop_single_review(after_id: int = 0) -> dict[str, Any]:
+    with connect() as connection:
+        cursor = connection.cursor()
+        stats = review_stats(cursor)
+        row = fetch_review_crop(cursor, "next", after_id)
+        if not row and after_id > 0:
+            row = fetch_review_crop(cursor, "next", 0)
+        if not row:
+            return {"status": "empty", "current": None, "stats": stats}
+        return {"status": "ok", "current": build_single_crop_response(row), "stats": stats}
+
+
+def get_previous_vn_visa_ocr_crop_single_review(before_id: int = 0) -> dict[str, Any]:
+    if before_id <= 0:
+        with connect() as connection:
+            cursor = connection.cursor()
+            return {"status": "empty", "current": None, "stats": review_stats(cursor)}
+
+    with connect() as connection:
+        cursor = connection.cursor()
+        stats = review_stats(cursor)
+        row = fetch_review_crop(cursor, "previous", before_id)
+        if not row:
+            return {"status": "empty", "current": None, "stats": stats}
+        return {"status": "ok", "current": build_single_crop_response(row), "stats": stats}
+
+
+def fetch_review_crop(cursor: Any, direction: str, anchor_id: int) -> dict[str, Any] | None:
+    if direction == "previous":
+        comparator = "<"
+        order = "DESC"
+    else:
+        comparator = ">"
+        order = "ASC"
+
+    if anchor_id > 0:
+        cursor.execute(
+            f"""
+            SELECT TOP 1
+                c.*,
+                vi.OriginalFileName AS VisaOriginalFileName,
+                vi.SourceKey AS VisaSourceKey
+            FROM dbo.readmrz_vn_visa_ocr_crops c
+            INNER JOIN dbo.readmrz_vn_visa_items vi ON vi.Id = c.VisaItemId
+            WHERE c.Id {comparator} ?
+              AND c.ReviewStatus = N'pending'
+            ORDER BY c.Id {order}
+            """,
+            anchor_id,
+        )
+    else:
+        cursor.execute(
+            """
+            SELECT TOP 1
+                c.*,
+                vi.OriginalFileName AS VisaOriginalFileName,
+                vi.SourceKey AS VisaSourceKey
+            FROM dbo.readmrz_vn_visa_ocr_crops c
+            INNER JOIN dbo.readmrz_vn_visa_items vi ON vi.Id = c.VisaItemId
+            WHERE c.ReviewStatus = N'pending'
+            ORDER BY c.Id ASC
+            """
+        )
+    return fetch_one_dict(cursor)
+
+
+def build_single_crop_response(row: dict[str, Any]) -> dict[str, Any]:
+    output_dir = crop_output_dir()
+    crop_path = output_dir / str(row.get("CropRelativePath") or "")
+    crop_base64 = ""
+    crop_content_type = mimetypes.guess_type(str(crop_path))[0] or "image/jpeg"
+    if crop_path.is_file():
+        crop_base64 = base64.b64encode(crop_path.read_bytes()).decode("ascii")
+
+    return {
+        "id": int(row["Id"]),
+        "visa_item_id": int(row["VisaItemId"]),
+        "source_key": row.get("SourceKey") or row.get("VisaSourceKey") or "",
+        "visa_image_name": row.get("VisaOriginalFileName") or "",
+        "field_name": row.get("FieldName") or "",
+        "crop_relative_path": row.get("CropRelativePath") or "",
+        "crop_content_type": crop_content_type,
+        "crop_base64": crop_base64,
+        "crop_width": int(row.get("CropWidth") or 0),
+        "crop_height": int(row.get("CropHeight") or 0),
+        "bbox": parse_bbox(row.get("BboxJson")),
+        "ocr_raw_text": row.get("OcrRawText") or "",
+        "ocr_score": float(row.get("OcrScore") or 0.0),
+        "review_status": row.get("ReviewStatus") or "pending",
+        "reviewed_text": row.get("ReviewedText") or "",
+    }
+
+
 def fetch_review_visa(cursor: Any, direction: str, anchor_id: int) -> dict[str, Any] | None:
     if direction == "previous":
         comparator = "<"
@@ -271,6 +364,46 @@ def save_vn_visa_ocr_crop_text(crop_id: int, reviewed_text: str, decision: str =
         connection.commit()
 
     return get_vn_visa_ocr_crop_review_by_id(visa_item_id)
+
+
+def save_vn_visa_ocr_crop_single_text(crop_id: int, reviewed_text: str, decision: str = "approved") -> dict[str, Any]:
+    if crop_id <= 0:
+        raise ValueError("id is required")
+    if decision not in {"pending", "approved", "rejected"}:
+        raise ValueError("decision must be pending, approved, or rejected")
+
+    with connect() as connection:
+        cursor = connection.cursor()
+        cursor.execute("SELECT Id FROM dbo.readmrz_vn_visa_ocr_crops WHERE Id = ?", crop_id)
+        row = cursor.fetchone()
+        if not row:
+            raise KeyError(f"Crop not found: {crop_id}")
+
+        reviewed_value = reviewed_text.strip()
+        cursor.execute(
+            """
+            UPDATE dbo.readmrz_vn_visa_ocr_crops
+            SET ReviewStatus = ?,
+                ReviewedText = ?,
+                ReviewedAt = CASE WHEN ? IN (N'approved', N'rejected') THEN SYSDATETIME() ELSE ReviewedAt END,
+                UpdatedDate = SYSDATETIME()
+            WHERE Id = ?
+            """,
+            decision,
+            reviewed_value if reviewed_value else None,
+            decision,
+            crop_id,
+        )
+        connection.commit()
+
+    next_response = get_next_vn_visa_ocr_crop_single_review(crop_id)
+    return {
+        "status": "ok",
+        "id": crop_id,
+        "decision": decision,
+        "next": next_response.get("current"),
+        "stats": next_response.get("stats", {}),
+    }
 
 
 def approve_vn_visa_ocr_crop_visa(visa_item_id: int, crops: list[dict[str, Any]]) -> dict[str, Any]:
