@@ -19,6 +19,15 @@ _DEFAULT_DET_SIZE = 640
 _DEFAULT_SCORE_THRESHOLD = 0.5
 _DEFAULT_MATCH_THRESHOLD = 0.45
 _DEFAULT_REVIEW_THRESHOLD = 0.35
+_DEFAULT_PASSPORT_LEFT_MAX_X_RATIO = 0.60
+_DEFAULT_PASSPORT_RIGHT_MIN_X_RATIO = 0.65
+_DEFAULT_PASSPORT_LEFT_BONUS = 0.35
+_DEFAULT_PASSPORT_RIGHT_PENALTY = 0.35
+_DEFAULT_PASSPORT_MIN_AREA_RATIO = 0.003
+_DEFAULT_PASSPORT_SMALL_FACE_PENALTY = 0.25
+_DEFAULT_PASSPORT_SIZE_BONUS_MAX = 0.25
+_DEFAULT_PASSPORT_SIZE_BONUS_SCALE = 8.0
+_DEFAULT_PASSPORT_KEEP_TOP = 1
 
 
 class FaceMatchService:
@@ -216,6 +225,14 @@ class FaceMatchService:
         elif not uploaded_faces:
             response["message"] = "Khong detect duoc mat tren anh mat vua upload."
         else:
+            passport_faces, passport_candidates = select_passport_face_rows(
+                passport_faces,
+                passport_payload.image.shape,
+            )
+            response["passport_face"]["face_candidates"] = passport_candidates
+            if passport_faces:
+                response["passport_face"]["face_bbox"] = face_bbox(passport_faces[0])
+                response["passport_face"]["face_confidence"] = face_confidence(passport_faces[0])
             best = self.best_face_pair(
                 passport_faces,
                 uploaded_faces,
@@ -298,6 +315,98 @@ def select_primary_face(faces: list[Any]) -> Any | None:
     if not faces:
         return None
     return max(faces, key=lambda face: face_confidence(face) * max(1.0, face_area(face)))
+
+
+def select_passport_face_rows(
+    faces: list[Any],
+    image_shape: tuple[int, ...],
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    if not faces:
+        return [], []
+    env = read_env_file()
+    keep_top = max(
+        1,
+        int(env_value(env, "READMRZ_PASSPORT_FACE_SELECTION_KEEP_TOP", str(_DEFAULT_PASSPORT_KEEP_TOP))),
+    )
+    ranked = sorted(
+        ((passport_face_selection_payload(face, image_shape, env), face) for face in faces),
+        key=lambda item: item[0]["selection_score"],
+        reverse=True,
+    )
+    selected_ids = {id(face) for _, face in ranked[:keep_top]}
+    candidates: list[dict[str, Any]] = []
+    for payload, face in ranked:
+        candidates.append({**payload, "selected": id(face) in selected_ids})
+    return [face for _, face in ranked[:keep_top]], candidates
+
+
+def passport_face_selection_payload(
+    face_row: Any,
+    image_shape: tuple[int, ...],
+    env: dict[str, str] | None = None,
+) -> dict[str, Any]:
+    loaded_env = env if env is not None else read_env_file()
+    image_height = max(1, int(image_shape[0]) if len(image_shape) >= 1 else 1)
+    image_width = max(1, int(image_shape[1]) if len(image_shape) >= 2 else 1)
+    box = face_bbox(face_row)
+    center_x_ratio = (float(box["left"]) + float(box["width"]) / 2.0) / image_width
+    center_y_ratio = (float(box["top"]) + float(box["height"]) / 2.0) / image_height
+    area_ratio = face_area(face_row) / float(image_width * image_height)
+    confidence = face_confidence(face_row)
+
+    left_max = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_LEFT_MAX_X_RATIO", str(_DEFAULT_PASSPORT_LEFT_MAX_X_RATIO))
+    )
+    right_min = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_RIGHT_MIN_X_RATIO", str(_DEFAULT_PASSPORT_RIGHT_MIN_X_RATIO))
+    )
+    left_bonus = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_LEFT_BONUS", str(_DEFAULT_PASSPORT_LEFT_BONUS))
+    )
+    right_penalty = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_RIGHT_PENALTY", str(_DEFAULT_PASSPORT_RIGHT_PENALTY))
+    )
+    min_area = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_MIN_AREA_RATIO", str(_DEFAULT_PASSPORT_MIN_AREA_RATIO))
+    )
+    small_penalty = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_SMALL_PENALTY", str(_DEFAULT_PASSPORT_SMALL_FACE_PENALTY))
+    )
+    size_bonus_max = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_SIZE_BONUS_MAX", str(_DEFAULT_PASSPORT_SIZE_BONUS_MAX))
+    )
+    size_bonus_scale = float(
+        env_value(loaded_env, "READMRZ_PASSPORT_FACE_SIZE_BONUS_SCALE", str(_DEFAULT_PASSPORT_SIZE_BONUS_SCALE))
+    )
+
+    selection_score = confidence
+    reasons: list[str] = []
+    if center_x_ratio <= left_max:
+        selection_score += left_bonus
+        reasons.append("left_portrait_bonus")
+    elif center_x_ratio >= right_min:
+        selection_score -= right_penalty
+        reasons.append("right_ghost_penalty")
+    else:
+        reasons.append("center_region")
+
+    size_bonus = min(size_bonus_max, max(0.0, area_ratio * size_bonus_scale))
+    selection_score += size_bonus
+    reasons.append("size_bonus")
+
+    if area_ratio < min_area:
+        selection_score -= small_penalty
+        reasons.append("small_face_penalty")
+
+    return {
+        "bbox": box,
+        "confidence": confidence,
+        "center_x_ratio": round(center_x_ratio, 4),
+        "center_y_ratio": round(center_y_ratio, 4),
+        "area_ratio": round(area_ratio, 6),
+        "selection_score": round(selection_score, 6),
+        "selection_reason": ",".join(reasons),
+    }
 
 
 def face_bbox(face_row: Any) -> dict[str, float]:

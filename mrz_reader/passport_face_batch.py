@@ -9,7 +9,7 @@ import numpy as np
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .document_orientation import PaddleDocumentOrientation
 from .env_config import env_value, read_env_file
-from .face_match import FaceMatchService, face_bbox, face_confidence
+from .face_match import FaceMatchService, face_bbox, face_confidence, passport_face_selection_payload
 from .file_type_classifier import FileTypeClassifier
 from .image_payload import (
     ImagePayload,
@@ -37,6 +37,8 @@ class DetectedFace:
     confidence: float
     aligned_face_content_type: str
     aligned_face_base64: str
+    selection_score: float = 0.0
+    selection_reason: str = ""
 
 
 @dataclass
@@ -153,7 +155,7 @@ def build_face_candidate(
     face_matcher: FaceMatchService,
     logger: Callable[[str], None] | None = None,
 ) -> FaceCandidate:
-    detections, detect_meta = build_detected_faces(payload, working, face_matcher)
+    detections, detect_meta = build_detected_faces(payload, working, face_matcher, selection_mode="face")
     primary = detections[0] if detections else None
     response = {
         "file_name": payload.file_name,
@@ -169,6 +171,7 @@ def build_face_candidate(
         "face_count": int(detect_meta["count"]),
         "face_bbox": primary.bbox if primary is not None else None,
         "face_confidence": primary.confidence if primary is not None else 0.0,
+        "face_candidates": detect_meta.get("candidates", []),
     }
     log_batch(
         logger,
@@ -201,7 +204,13 @@ def build_passport_candidate(
         include_images=False,
     )
     compact_mrz = compact_yolo_read_payload(mrz_payload)
-    detections, detect_meta = build_detected_faces(payload, working, face_matcher, include_aligned=True)
+    detections, detect_meta = build_detected_faces(
+        payload,
+        working,
+        face_matcher,
+        include_aligned=True,
+        selection_mode="passport",
+    )
     primary = detections[0] if detections else None
 
     face_base64 = ""
@@ -224,6 +233,7 @@ def build_passport_candidate(
         "face_content_type": face_content_type,
         "face_bbox": primary.bbox if primary is not None else None,
         "face_confidence": primary.confidence if primary is not None else 0.0,
+        "face_candidates": detect_meta.get("candidates", []),
         "mrz": build_mrz_payload(compact_mrz),
         "parsed": build_parsed_payload(compact_mrz),
         "processing_ms": int((perf_counter() - started) * 1000),
@@ -234,6 +244,8 @@ def build_passport_candidate(
         f"file={payload.file_name} face_detected={primary is not None} "
         f"face_count={int(detect_meta['count'])} "
         f"face_conf={response['face_confidence']} "
+        f"face_selection_score={(primary.selection_score if primary is not None else 0.0)} "
+        f"face_selection_reason={(primary.selection_reason if primary is not None else '')} "
         f"embeddings={len(detections)} "
         f"mrz_found={response['mrz']['found']} "
         f"mrz_conf={response['mrz']['confidence']} "
@@ -249,14 +261,28 @@ def build_detected_faces(
     face_matcher: FaceMatchService,
     *,
     include_aligned: bool = False,
+    selection_mode: str = "face",
 ) -> tuple[list[DetectedFace], dict[str, Any]]:
     env = read_env_file()
     max_detections = max(1, int(env_value(env, "READMRZ_FACE_MATCH_MAX_DETECTIONS_PER_IMAGE", "5")))
     face_rows, detect_meta = face_matcher.detect_faces(working.image)
-    face_rows = sorted(face_rows, key=face_confidence, reverse=True)[:max_detections]
+    face_rows, candidate_payloads = rank_face_rows(face_rows, working.image.shape, selection_mode, env)
+    if selection_mode == "passport":
+        keep_top = max(1, int(env_value(env, "READMRZ_PASSPORT_FACE_SELECTION_KEEP_TOP", "1")))
+        face_rows = face_rows[: min(max_detections, keep_top)]
+    else:
+        face_rows = face_rows[:max_detections]
+    selected_ids = {id(face_row) for face_row in face_rows}
+    detect_meta["candidates"] = [
+        {**candidate, "selected": candidate.get("_id") in selected_ids}
+        for candidate in candidate_payloads
+    ]
+    for candidate in detect_meta["candidates"]:
+        candidate.pop("_id", None)
 
     detections: list[DetectedFace] = []
     for face_row in face_rows:
+        selection_payload = candidate_by_id(candidate_payloads, id(face_row))
         embedding, face_meta = face_matcher.extract_embedding(working.image, face_row)
         aligned_base64 = str(face_meta.get("aligned_face_base64") or "")
         aligned_content_type = str(face_meta.get("aligned_face_content_type") or "")
@@ -272,9 +298,56 @@ def build_detected_faces(
                 confidence=face_confidence(face_row),
                 aligned_face_content_type=aligned_content_type if include_aligned else "",
                 aligned_face_base64=aligned_base64 if include_aligned else "",
+                selection_score=float(selection_payload.get("selection_score") or face_confidence(face_row)),
+                selection_reason=str(selection_payload.get("selection_reason") or ""),
             )
         )
     return detections, detect_meta
+
+
+def rank_face_rows(
+    face_rows: list[Any],
+    image_shape: tuple[int, ...],
+    selection_mode: str,
+    env: dict[str, str],
+) -> tuple[list[Any], list[dict[str, Any]]]:
+    if selection_mode == "passport":
+        ranked = sorted(
+            ((passport_face_selection_payload(face_row, image_shape, env), face_row) for face_row in face_rows),
+            key=lambda item: item[0]["selection_score"],
+            reverse=True,
+        )
+    else:
+        ranked = sorted(
+            ((generic_face_selection_payload(face_row, image_shape), face_row) for face_row in face_rows),
+            key=lambda item: item[0]["selection_score"],
+            reverse=True,
+        )
+    return [face_row for _, face_row in ranked], [{**payload, "_id": id(face_row)} for payload, face_row in ranked]
+
+
+def generic_face_selection_payload(face_row: Any, image_shape: tuple[int, ...]) -> dict[str, Any]:
+    image_height = max(1, int(image_shape[0]) if len(image_shape) >= 1 else 1)
+    image_width = max(1, int(image_shape[1]) if len(image_shape) >= 2 else 1)
+    box = face_bbox(face_row)
+    area_ratio = (float(box["width"]) * float(box["height"])) / float(image_width * image_height)
+    selection_score = face_confidence(face_row) + min(0.25, area_ratio * 8.0)
+    return {
+        "bbox": box,
+        "confidence": face_confidence(face_row),
+        "center_x_ratio": round((float(box["left"]) + float(box["width"]) / 2.0) / image_width, 4),
+        "center_y_ratio": round((float(box["top"]) + float(box["height"]) / 2.0) / image_height, 4),
+        "area_ratio": round(area_ratio, 6),
+        "selection_score": round(selection_score, 6),
+        "selection_reason": "generic_confidence_size",
+    }
+
+
+def candidate_by_id(candidates: list[dict[str, Any]], candidate_id: int) -> dict[str, Any]:
+    for candidate in candidates:
+        if candidate.get("_id") == candidate_id:
+            return candidate
+    return {}
 
 
 def build_classification_payload(payload: dict[str, Any]) -> dict[str, Any]:
