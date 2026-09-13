@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import hashlib
+from difflib import SequenceMatcher
 import json
 import os
 from pathlib import Path
@@ -274,8 +275,10 @@ class VnVisaReadService:
                 continue
 
             line_items = split_text_lines(crop) if detection.field_name in self.multiline_fields else []
-            if not line_items:
-                line_items = [{"image": crop, "bbox_in_crop": [0.0, 0.0, float(crop.shape[1]), float(crop.shape[0])]}]
+            line_items = [
+                {"image": crop, "bbox_in_crop": [0.0, 0.0, float(crop.shape[1]), float(crop.shape[0])], "source": "full_crop"},
+                *line_items,
+            ]
 
             job_indexes: list[int] = []
             for line_index, line_item in enumerate(line_items, start=1):
@@ -287,6 +290,7 @@ class VnVisaReadService:
                         "path": crop_path,
                         "field_name": detection.field_name,
                         "bbox_in_crop": line_item["bbox_in_crop"],
+                        "source": line_item.get("source") or "split_line",
                     }
                 )
 
@@ -317,18 +321,21 @@ class VnVisaReadService:
                     "text": text,
                     "confidence": score,
                     "bbox_in_crop": job["bbox_in_crop"],
+                    "source": job.get("source") or "split_line",
                 }
             )
 
-        for field_payload in fields.values():
+        for field_name, field_payload in fields.items():
             if not isinstance(field_payload, dict):
                 continue
             field_payload.pop("_job_indexes", None)
             lines = field_payload.get("lines") or []
             texts = [str(line.get("text") or "").strip() for line in lines if str(line.get("text") or "").strip()]
             scores = [float(line.get("confidence") or 0.0) for line in lines]
-            field_payload["text"] = normalize_space(" ".join(texts))
+            raw_text = normalize_space(" ".join(texts))
+            field_payload["text"] = raw_text
             field_payload["confidence"] = round(sum(scores) / len(scores), 6) if scores else 0.0
+            post_process_field(field_name, field_payload)
             if len(lines) <= 1:
                 field_payload.pop("lines", None)
 
@@ -461,18 +468,20 @@ def split_text_lines(crop: np.ndarray) -> list[dict[str, Any]]:
 
     gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
     gray = cv2.GaussianBlur(gray, (3, 3), 0)
-    binary = cv2.adaptiveThreshold(
+    _, otsu = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
+    adaptive = cv2.adaptiveThreshold(
         gray,
         255,
         cv2.ADAPTIVE_THRESH_GAUSSIAN_C,
         cv2.THRESH_BINARY_INV,
-        max(15, (height // 4) * 2 + 1),
-        9,
+        max(15, (height // 3) * 2 + 1),
+        7,
     )
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(3, width // 35), 2))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel, iterations=1)
+    binary = cv2.bitwise_or(otsu, adaptive)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (max(2, width // 60), 1))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=1)
     projection = (binary > 0).sum(axis=1)
-    threshold = max(2, int(width * 0.015))
+    threshold = max(1, int(width * 0.008))
 
     bands: list[list[int]] = []
     start: int | None = None
@@ -507,16 +516,195 @@ def split_text_lines(crop: np.ndarray) -> list[dict[str, Any]]:
         padded.append([y1, y2])
 
     if len(padded) <= 1:
-        return []
+        middle_split = split_crop_middle(crop)
+        return middle_split
 
     return [
         {
             "image": crop[y1:y2, :].copy(),
             "bbox_in_crop": [0.0, float(y1), float(width), float(y2)],
+            "source": "projection_line",
         }
         for y1, y2 in padded
         if y2 > y1
     ]
+
+
+def split_crop_middle(crop: np.ndarray) -> list[dict[str, Any]]:
+    height, width = crop.shape[:2]
+    if height < 32:
+        return []
+    mid = height // 2
+    gap = max(1, height // 24)
+    parts = [(0, max(1, mid + gap)), (max(0, mid - gap), height)]
+    output: list[dict[str, Any]] = []
+    for top, bottom in parts:
+        if bottom - top < max(8, int(height * 0.28)):
+            continue
+        output.append(
+            {
+                "image": crop[top:bottom, :].copy(),
+                "bbox_in_crop": [0.0, float(top), float(width), float(bottom)],
+                "source": "middle_split",
+            }
+        )
+    return output if len(output) >= 2 else []
+
+
+def post_process_field(field_name: str, payload: dict[str, Any]) -> None:
+    if field_name == "number_of_entries":
+        normalize_number_of_entries(payload)
+
+
+def normalize_number_of_entries(payload: dict[str, Any]) -> None:
+    lines = payload.get("lines") or []
+    candidates = [str(payload.get("text") or "")]
+    candidates.extend(str(line.get("text") or "") for line in lines)
+    joined = " ".join(candidates)
+    normalized = normalize_for_match(joined)
+    single_score = max(
+        fuzzy_score(normalized, target)
+        for target in (
+            "motlan",
+            "motlansingleentry",
+            "single",
+            "singleentry",
+            "oneentry",
+            "01",
+        )
+    )
+    multiple_score = max(
+        fuzzy_score(normalized, target)
+        for target in (
+            "nhieulan",
+            "nhieulanmultipleentries",
+            "multiple",
+            "multipleentries",
+            "multientry",
+        )
+    )
+
+    if normalized in {"1", "01"}:
+        single_score += 0.55
+    if normalized == "n":
+        multiple_score += 0.55
+    if "one" in normalized or "single" in normalized:
+        single_score += 0.35
+    if "multi" in normalized or "multiple" in normalized:
+        multiple_score += 0.35
+    if "entry" in normalized or "ntry" in normalized or "nry" in normalized:
+        single_score += 0.15
+    if "entries" in normalized or "tries" in normalized:
+        multiple_score += 0.15
+
+    best_text = ""
+    best_score = 0.0
+    best_kind = ""
+    if single_score >= multiple_score and single_score >= 0.42:
+        best_text = "Một lần/Single entry"
+        best_score = single_score
+        best_kind = "single_entry_dictionary"
+    elif multiple_score > single_score and multiple_score >= 0.42:
+        best_text = "Nhiều lần/Multiple entries"
+        best_score = multiple_score
+        best_kind = "multiple_entries_dictionary"
+
+    if not best_text:
+        return
+
+    raw_text = normalize_space(str(payload.get("text") or ""))
+    payload["raw_text"] = raw_text
+    payload["text"] = best_text
+    payload["normalized_by"] = best_kind
+    clamped_score = min(1.0, round(best_score, 6))
+    payload["normalization_score"] = clamped_score
+    payload["confidence"] = max(float(payload.get("confidence") or 0.0), min(0.95, clamped_score))
+
+
+def normalize_for_match(value: str) -> str:
+    text = str(value or "").lower()
+    replacements = {
+        "ộ": "o",
+        "ồ": "o",
+        "ố": "o",
+        "ỗ": "o",
+        "ổ": "o",
+        "ơ": "o",
+        "ợ": "o",
+        "ờ": "o",
+        "ớ": "o",
+        "ở": "o",
+        "ỡ": "o",
+        "ư": "u",
+        "ừ": "u",
+        "ứ": "u",
+        "ử": "u",
+        "ữ": "u",
+        "ự": "u",
+        "ầ": "a",
+        "ấ": "a",
+        "ậ": "a",
+        "ẩ": "a",
+        "ẫ": "a",
+        "ă": "a",
+        "ằ": "a",
+        "ắ": "a",
+        "ặ": "a",
+        "ẳ": "a",
+        "ẵ": "a",
+        "á": "a",
+        "à": "a",
+        "ả": "a",
+        "ã": "a",
+        "ạ": "a",
+        "é": "e",
+        "è": "e",
+        "ẻ": "e",
+        "ẽ": "e",
+        "ẹ": "e",
+        "ê": "e",
+        "ề": "e",
+        "ế": "e",
+        "ể": "e",
+        "ễ": "e",
+        "ệ": "e",
+        "í": "i",
+        "ì": "i",
+        "ỉ": "i",
+        "ĩ": "i",
+        "ị": "i",
+        "ó": "o",
+        "ò": "o",
+        "ỏ": "o",
+        "õ": "o",
+        "ọ": "o",
+        "ú": "u",
+        "ù": "u",
+        "ủ": "u",
+        "ũ": "u",
+        "ụ": "u",
+        "ý": "y",
+        "ỳ": "y",
+        "ỷ": "y",
+        "ỹ": "y",
+        "ỵ": "y",
+        "đ": "d",
+    }
+    for source, target in replacements.items():
+        text = text.replace(source, target)
+    return re.sub(r"[^a-z0-9]+", "", text)
+
+
+def fuzzy_score(value: str, target: str) -> float:
+    if not value and not target:
+        return 1.0
+    if not value or not target:
+        return 0.0
+    if target in value:
+        return 1.0
+    if value in target and len(value) >= 2:
+        return 0.75
+    return SequenceMatcher(None, value, target).ratio()
 
 
 def parse_recognition_result(item: Any) -> dict[str, Any]:
