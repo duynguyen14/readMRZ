@@ -59,6 +59,7 @@ from .env_config import env_value, read_env_file
 from .face_match import FaceMatchService
 from .file_type_classifier import FileTypeClassifier
 from .passport_face_batch import process_batch
+from .vn_visa_read_pipeline import VnVisaReadService
 from .yolo_detector import YoloMrzDetector
 from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
@@ -236,6 +237,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     custom_mrz_ocr: CustomMrzCtcRecognizer | None = None
     file_type_classifier: FileTypeClassifier | None = None
     face_matcher: FaceMatchService | None = None
+    vn_visa_reader: VnVisaReadService | None = None
 
     def get_engine() -> MrzOcrEngine:
         nonlocal engine
@@ -297,6 +299,20 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             )
         return face_matcher
 
+    def get_vn_visa_reader() -> VnVisaReadService:
+        nonlocal vn_visa_reader
+        if vn_visa_reader is None:
+            log_api("Loading VN visa read service")
+            vn_visa_reader = VnVisaReadService()
+            info = vn_visa_reader.runtime_info()
+            log_api(
+                "Loaded VN visa read service "
+                f"detector_load_ms={info.get('detector_model_load_ms')} "
+                f"ocr_load_ms={info.get('ocr_model_load_ms')} "
+                f"device={info.get('device')} ocr_device={info.get('ocr_device')}"
+            )
+        return vn_visa_reader
+
     if env_bool(server_env, "READMRZ_API_PRELOAD_MODELS", True):
         preload_started = time.perf_counter()
         log_api("Preloading upload pipeline models")
@@ -339,6 +355,17 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         if env_bool(server_env, "READMRZ_FACE_MATCH_WARMUP", False):
             warmup_ms = face_match_model.warmup()
             log_api(f"Warmed face match service warmup_ms={warmup_ms}")
+
+    if env_bool(server_env, "READMRZ_VN_VISA_READ_PRELOAD", False):
+        preload_started = time.perf_counter()
+        vn_visa_read_model = get_vn_visa_reader()
+        log_api(
+            "Preloaded VN visa read service "
+            f"total_ms={int((time.perf_counter() - preload_started) * 1000)}"
+        )
+        if env_bool(server_env, "READMRZ_VN_VISA_READ_WARMUP", False):
+            warmup_ms = vn_visa_read_model.warmup()
+            log_api(f"Warmed VN visa read service warmup_ms={warmup_ms}")
 
     def validate_configured_api_key(payload: dict) -> None:
         if not api_key:
@@ -403,6 +430,16 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(200, {"status": "success", "data": get_face_matcher().runtime_info()})
                 except Exception as exc:
                     log_api(f"FACE_MATCH_RUNTIME error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+            if parsed_url.path in {
+                "/vn-visa-read/runtime",
+                "/api/vn-visa/read/runtime",
+            }:
+                try:
+                    self.send_json(200, {"status": "success", "data": get_vn_visa_reader().runtime_info()})
+                except Exception as exc:
+                    log_api(f"VN_VISA_READ_RUNTIME error {exc}")
                     self.send_json(500, {"status": "error", "error": str(exc)})
                 return
             if parsed_url.path == "/label-review/next":
@@ -758,6 +795,55 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 except Exception as exc:
                     log_api(f"PASSPORT_FACE_MATCH_BATCH error {exc}")
                     self.send_json(400, {"error": str(exc), "data": []})
+                finally:
+                    if acquired:
+                        inference_limit.release()
+                return
+
+            if parsed_url.path in {
+                "/vn-visa-read",
+                "/api/vn-visa/read",
+            }:
+                acquired = False
+                try:
+                    request_started = time.perf_counter()
+                    acquired = self.acquire_inference_slot()
+                    if not acquired:
+                        self.send_json(503, {"status": "error", "error": "Server is busy. Try again later."})
+                        return
+                    request_payload = self.read_json_body()
+                    validate_configured_api_key(request_payload)
+                    image_base64 = (
+                        request_payload.get("image_base64")
+                        or request_payload.get("base64")
+                        or request_payload.get("dataBase64")
+                    )
+                    if not isinstance(image_base64, str) or not image_base64.strip():
+                        raise ValueError("image_base64 or base64 is required")
+                    file_name = str(
+                        request_payload.get("file_name")
+                        or request_payload.get("filename")
+                        or request_payload.get("name")
+                        or "visa.jpg"
+                    )
+                    result = get_vn_visa_reader().read_base64(
+                        image_base64=image_base64,
+                        file_name=file_name,
+                        orientation=get_document_orientation(),
+                    )
+                    log_api(
+                        "VN_VISA_READ done "
+                        f"file={file_name} fields={len(result.get('fields') or {})} "
+                        f"raw_detections={result.get('raw_detections')} "
+                        f"latency_ms={int((time.perf_counter() - request_started) * 1000)}"
+                    )
+                    self.send_json(200, {"status": "success", "data": result})
+                except PermissionError as exc:
+                    log_api(f"VN_VISA_READ auth_error {exc}")
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"VN_VISA_READ error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
                 finally:
                     if acquired:
                         inference_limit.release()
