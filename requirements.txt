@@ -2,7 +2,7 @@ numpy
 opencv-python-headless
 onnxruntime
 rapidocr-onnxruntime
-paddlepaddle
+paddlepaddle==3.3.1
 paddleocr>=3.0.0
 paddlex
 pyodbc

@@ -60,6 +60,7 @@ from .face_match import FaceMatchService
 from .file_type_classifier import FileTypeClassifier
 from .passport_face_batch import process_batch
 from .vn_visa_read_pipeline import VnVisaReadService
+from .vn_visa_standardize import standardize_vn_visa_read_payload
 from .yolo_detector import YoloMrzDetector
 from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
@@ -843,6 +844,56 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(401, {"status": "error", "error": str(exc)})
                 except Exception as exc:
                     log_api(f"VN_VISA_READ error {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                finally:
+                    if acquired:
+                        inference_limit.release()
+                return
+
+            if parsed_url.path in {
+                "/vn-visa-read-standard",
+                "/api/vn-visa/read-standard",
+            }:
+                acquired = False
+                try:
+                    request_started = time.perf_counter()
+                    acquired = self.acquire_inference_slot()
+                    if not acquired:
+                        self.send_json(503, {"status": "error", "error": "Server is busy. Try again later."})
+                        return
+                    request_payload = self.read_json_body()
+                    validate_configured_api_key(request_payload)
+                    image_base64 = (
+                        request_payload.get("image_base64")
+                        or request_payload.get("base64")
+                        or request_payload.get("dataBase64")
+                    )
+                    if not isinstance(image_base64, str) or not image_base64.strip():
+                        raise ValueError("image_base64 or base64 is required")
+                    file_name = str(
+                        request_payload.get("file_name")
+                        or request_payload.get("filename")
+                        or request_payload.get("name")
+                        or "visa.jpg"
+                    )
+                    read_result = get_vn_visa_reader().read_base64(
+                        image_base64=image_base64,
+                        file_name=file_name,
+                        orientation=get_document_orientation(),
+                    )
+                    result = standardize_vn_visa_read_payload(read_result)
+                    log_api(
+                        "VN_VISA_READ_STANDARD done "
+                        f"file={file_name} fields={len(result)} "
+                        f"raw_detections={read_result.get('raw_detections')} "
+                        f"latency_ms={int((time.perf_counter() - request_started) * 1000)}"
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    log_api(f"VN_VISA_READ_STANDARD auth_error {exc}")
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"VN_VISA_READ_STANDARD error {exc}")
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 finally:
                     if acquired:

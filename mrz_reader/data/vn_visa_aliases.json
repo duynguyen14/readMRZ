@@ -1,0 +1,53 @@
+{
+  "number_of_entries": {
+    "1": [
+      "1",
+      "01",
+      "one",
+      "one entry",
+      "single",
+      "single entry",
+      "mot lan",
+      "một lần",
+      "mot lan single entry",
+      "một lần single entry",
+      "signe",
+      "sigle"
+    ],
+    "N": [
+      "n",
+      "nhieu lan",
+      "nhiều lần",
+      "multiple",
+      "multiple entry",
+      "multiple entries",
+      "multi",
+      "multi entry"
+    ]
+  },
+  "nationality": {
+    "CHN": [
+      "china",
+      "chinese",
+      "trung quoc",
+      "trung quốc",
+      "trung quoc china",
+      "trung quốc china",
+      "cn",
+      "chn"
+    ]
+  },
+  "issue_place": {
+    "TSN": [
+      "tan son nhat",
+      "tân sơn nhất",
+      "tan som nhat",
+      "tan son nhat.",
+      "sbqt tan son nhat",
+      "sbqt tân sơn nhất",
+      "san bay tan son nhat",
+      "cua khau san bay tan son nhat",
+      "cửa khẩu sân bay tân sơn nhất"
+    ]
+  }
+}

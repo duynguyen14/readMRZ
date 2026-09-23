@@ -1,9 +1,10 @@
-FROM python:3.11-slim-bookworm
+FROM python:3.13-slim-bookworm
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PIP_NO_CACHE_DIR=1 \
-    PIP_DISABLE_PIP_VERSION_CHECK=1
+    PIP_DISABLE_PIP_VERSION_CHECK=1 \
+    PADDLE_PDX_MODEL_SOURCE=BOS
 
 WORKDIR /app
 
@@ -13,8 +14,11 @@ RUN apt-get update \
         ca-certificates \
         curl \
         gnupg \
+        libgl1 \
         libglib2.0-0 \
         libgomp1 \
+        libsm6 \
+        libxext6 \
         unixodbc \
         unixodbc-dev \
     && install -d /etc/apt/keyrings \
@@ -32,7 +36,7 @@ RUN python -m pip install --upgrade pip \
 
 COPY . .
 
-EXPOSE 8080
+EXPOSE 8080 8200
 
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
     CMD python -c "import os, urllib.request; port=os.environ.get('READMRZ_API_PORT','8080'); urllib.request.urlopen(f'http://127.0.0.1:{port}/health', timeout=3)"
