@@ -14,6 +14,7 @@ from typing import Any
 
 import cv2
 import numpy as np
+import yaml
 
 from .document_orientation import PaddleDocumentOrientation, env_bool
 from .env_config import PROJECT_ROOT, env_value, read_env_file
@@ -116,7 +117,6 @@ class VnVisaReadService:
         self.keep_temp = env_bool(env, "READMRZ_VN_VISA_READ_KEEP_TEMP", False)
 
         from ultralytics import YOLO
-        from paddleocr import TextRecognition
 
         os.environ["PADDLE_PDX_MODEL_SOURCE"] = env_value(env, "PADDLE_PDX_MODEL_SOURCE", "BOS")
 
@@ -125,11 +125,13 @@ class VnVisaReadService:
         self.yolo_names = model_class_names(self.yolo_model)
         self.yolo_load_ms = int((time.perf_counter() - yolo_started) * 1000)
 
-        ocr_kwargs: dict[str, Any] = {"model_name": self.ocr_model_name, "device": self.ocr_device}
-        if self.ocr_model_dir is not None:
-            ocr_kwargs["model_dir"] = str(self.ocr_model_dir)
         ocr_started = time.perf_counter()
-        self.ocr_model = TextRecognition(**ocr_kwargs)
+        self.ocr_model = create_ocr_recognizer(
+            env=env,
+            model_name=self.ocr_model_name,
+            model_dir=self.ocr_model_dir,
+            device=self.ocr_device,
+        )
         self.ocr_load_ms = int((time.perf_counter() - ocr_started) * 1000)
         self._yolo_lock = threading.Lock()
         self._ocr_lock = threading.Lock()
@@ -143,7 +145,7 @@ class VnVisaReadService:
             "detector_iou": self.iou,
             "detector_imgsz": self.imgsz,
             "device": self.device,
-            "ocr": "PaddleOCR TextRecognition",
+            "ocr": getattr(self.ocr_model, "engine_name", "PaddleOCR TextRecognition"),
             "ocr_model_name": self.ocr_model_name,
             "ocr_model_dir": str(self.ocr_model_dir) if self.ocr_model_dir else "",
             "ocr_device": self.ocr_device,
@@ -169,8 +171,7 @@ class VnVisaReadService:
                     max_det=self.max_det,
                     verbose=False,
                 )
-            with self._ocr_lock:
-                list(self.ocr_model.predict(input=[str(temp_path)], batch_size=1))
+            self.predict_ocr([temp_path])
         finally:
             if not self.keep_temp:
                 safe_unlink(temp_path)
@@ -345,8 +346,113 @@ class VnVisaReadService:
         if not paths:
             return []
         with self._ocr_lock:
+            if hasattr(self.ocr_model, "predict_paths"):
+                return self.ocr_model.predict_paths(paths, batch_size=self.ocr_batch_size)
             output = self.ocr_model.predict(input=[str(path) for path in paths], batch_size=self.ocr_batch_size)
         return [parse_recognition_result(item) for item in output]
+
+
+def create_ocr_recognizer(
+    *,
+    env: dict[str, str],
+    model_name: str,
+    model_dir: Path | None,
+    device: str,
+) -> Any:
+    engine = env_value(env, "READMRZ_VN_VISA_READ_OCR_ENGINE", "auto").strip().lower()
+    if engine in {"custom_ctc", "paddle_inference_ctc"} or (
+        engine == "auto" and model_dir is not None and is_paddle_ctc_inference_dir(model_dir)
+    ):
+        return PaddleCtcTextRecognizer(model_dir=model_dir, device=device, env=env)
+
+    from paddleocr import TextRecognition
+
+    ocr_kwargs: dict[str, Any] = {"model_name": model_name, "device": device}
+    if model_dir is not None:
+        ocr_kwargs["model_dir"] = str(model_dir)
+    model = TextRecognition(**ocr_kwargs)
+    setattr(model, "engine_name", "PaddleOCR TextRecognition")
+    return model
+
+
+def is_paddle_ctc_inference_dir(path: Path) -> bool:
+    return (
+        path.is_dir()
+        and (path / "inference.pdiparams").is_file()
+        and ((path / "inference.json").is_file() or (path / "inference.pdmodel").is_file())
+        and ((path / "vn_visa_rec_dict.txt").is_file() or (path / "ppocr_keys_v1.txt").is_file())
+    )
+
+
+class PaddleCtcTextRecognizer:
+    engine_name = "Paddle inference CRNN CTC"
+
+    def __init__(self, *, model_dir: Path | None, device: str, env: dict[str, str]) -> None:
+        if model_dir is None:
+            raise ValueError("READMRZ_VN_VISA_READ_OCR_MODEL_DIR is required for custom CTC OCR")
+        self.model_dir = model_dir
+        self.device = device
+        self.cpu_threads = max(1, int(env_value(env, "READMRZ_VN_VISA_READ_OCR_CPU_THREADS", "4")))
+        self.model_file = first_existing(model_dir / "inference.json", model_dir / "inference.pdmodel")
+        self.params_file = model_dir / "inference.pdiparams"
+        if self.model_file is None:
+            raise FileNotFoundError(f"Missing inference.json or inference.pdmodel in OCR model dir: {model_dir}")
+        if not self.params_file.is_file():
+            raise FileNotFoundError(f"Missing inference.pdiparams in OCR model dir: {model_dir}")
+
+        configured_dict = env_value(env, "READMRZ_VN_VISA_READ_OCR_DICT_PATH", "").strip()
+        self.dict_path = Path(configured_dict).expanduser().resolve() if configured_dict else first_existing(
+            model_dir / "vn_visa_rec_dict.txt",
+            model_dir / "ppocr_keys_v1.txt",
+        )
+        if self.dict_path is None or not self.dict_path.is_file():
+            raise FileNotFoundError(
+                "Missing OCR dictionary. Put vn_visa_rec_dict.txt in OCR model dir "
+                "or set READMRZ_VN_VISA_READ_OCR_DICT_PATH."
+            )
+
+        self.inference_config = load_yaml(model_dir / "inference.yml")
+        self.training_config = load_yaml(model_dir / "vn_visa_crnn_ctc_48x640.yml")
+        self.image_shape = read_rec_image_shape(self.inference_config, self.training_config)
+        self.characters = read_rec_dictionary(
+            self.dict_path,
+            use_space_char=read_use_space_char(self.inference_config, self.training_config),
+        )
+
+        try:
+            import paddle.inference as paddle_infer
+        except ImportError as exc:
+            raise RuntimeError("PaddlePaddle is required for custom VN visa OCR inference.") from exc
+
+        config = paddle_infer.Config(str(self.model_file), str(self.params_file))
+        configure_paddle_inference_device(config, device, self.cpu_threads)
+        if env_bool(env, "READMRZ_VN_VISA_READ_OCR_MEMORY_OPTIM", True):
+            config.enable_memory_optim()
+        config.disable_glog_info()
+        self.predictor = paddle_infer.create_predictor(config)
+        input_names = self.predictor.get_input_names()
+        output_names = self.predictor.get_output_names()
+        if len(input_names) != 1 or not output_names:
+            raise RuntimeError(f"Unexpected VN visa OCR inputs/outputs: inputs={input_names}, outputs={output_names}")
+        self.input_name = input_names[0]
+        self.output_name = output_names[0]
+
+    def predict_paths(self, paths: list[Path], *, batch_size: int) -> list[dict[str, Any]]:
+        output: list[dict[str, Any]] = []
+        for start in range(0, len(paths), max(1, batch_size)):
+            batch_paths = paths[start : start + max(1, batch_size)]
+            images = [read_image(path) for path in batch_paths]
+            batch = np.stack([preprocess_rec_image(image, self.image_shape) for image in images])
+            input_handle = self.predictor.get_input_handle(self.input_name)
+            input_handle.reshape(batch.shape)
+            input_handle.copy_from_cpu(batch)
+            self.predictor.run()
+            logits = self.predictor.get_output_handle(self.output_name).copy_to_cpu()
+            for text, confidence in decode_ctc_batch(logits, self.characters):
+                output.append({"text": normalize_space(text), "score": round(confidence, 6), "raw": {}})
+        while len(output) < len(paths):
+            output.append({"text": "", "score": 0.0, "raw": {"error": "OCR returned fewer results than inputs"}})
+        return output[: len(paths)]
 
 
 def resolve_model_path(raw_value: str) -> Path:
@@ -376,8 +482,153 @@ def optional_path(raw_value: str) -> Path | None:
     return path
 
 
+def first_existing(*paths: Path) -> Path | None:
+    for path in paths:
+        if path.is_file():
+            return path.resolve()
+    return None
+
+
 def csv_values(value: str) -> list[str]:
     return [item.strip() for item in str(value or "").split(",") if item.strip()]
+
+
+def load_yaml(path: Path) -> dict[str, Any]:
+    if not path.is_file():
+        return {}
+    payload = yaml.safe_load(path.read_text(encoding="utf-8"))
+    return payload if isinstance(payload, dict) else {}
+
+
+def read_rec_image_shape(*configs: dict[str, Any]) -> tuple[int, int, int]:
+    for config in configs:
+        for transform in (config or {}).get("PreProcess", {}).get("transform_ops", []):
+            shape = transform_image_shape(transform)
+            if shape is not None:
+                return shape
+        for section in ("Eval", "Train"):
+            transforms = (((config or {}).get(section) or {}).get("dataset") or {}).get("transforms", [])
+            for transform in transforms:
+                shape = transform_image_shape(transform)
+                if shape is not None:
+                    return shape
+    return 3, 48, 640
+
+
+def transform_image_shape(transform: Any) -> tuple[int, int, int] | None:
+    if not isinstance(transform, dict) or "RecResizeImg" not in transform:
+        return None
+    values = (transform.get("RecResizeImg") or {}).get("image_shape", [])
+    if not isinstance(values, list | tuple) or len(values) < 3:
+        return None
+    return int(values[0]), int(values[1]), int(values[2])
+
+
+def read_use_space_char(*configs: dict[str, Any]) -> bool:
+    for config in configs:
+        global_config = (config or {}).get("Global") or {}
+        if "use_space_char" in global_config:
+            return bool(global_config.get("use_space_char"))
+        post_process = (config or {}).get("PostProcess") or {}
+        if "use_space_char" in post_process:
+            return bool(post_process.get("use_space_char"))
+    return True
+
+
+def read_rec_dictionary(path: Path, *, use_space_char: bool) -> list[str]:
+    characters = [line.rstrip("\r\n") for line in path.read_text(encoding="utf-8").splitlines()]
+    characters = [character for character in characters if character]
+    if use_space_char and " " not in characters:
+        characters.append(" ")
+    if not characters:
+        raise ValueError(f"OCR dictionary is empty: {path}")
+    return characters
+
+
+def configure_paddle_inference_device(config: Any, device: str, cpu_threads: int) -> None:
+    normalized = str(device or "cpu").strip().lower()
+    if normalized.startswith("gpu") or normalized.startswith("cuda"):
+        device_id = 0
+        if ":" in normalized:
+            try:
+                device_id = int(normalized.split(":", 1)[1])
+            except ValueError:
+                device_id = 0
+        config.enable_use_gpu(500, device_id)
+        return
+    config.disable_gpu()
+    config.set_cpu_math_library_num_threads(max(1, cpu_threads))
+
+
+def read_image(path: Path) -> np.ndarray:
+    data = np.fromfile(str(path), dtype=np.uint8)
+    image = cv2.imdecode(data, cv2.IMREAD_COLOR)
+    if image is None:
+        raise RuntimeError(f"Cannot read OCR crop image: {path}")
+    return image
+
+
+def preprocess_rec_image(image: np.ndarray, image_shape: tuple[int, int, int]) -> np.ndarray:
+    channels, target_height, target_width = image_shape
+    if channels != 3:
+        raise ValueError(f"VN visa OCR expects 3 channels, got {channels}")
+    if image.ndim == 2:
+        image = cv2.cvtColor(image, cv2.COLOR_GRAY2BGR)
+    source_height, source_width = image.shape[:2]
+    resized_width = min(
+        target_width,
+        max(1, int(round(target_height * source_width / max(1, source_height)))),
+    )
+    resized = cv2.resize(image, (resized_width, target_height), interpolation=cv2.INTER_LINEAR)
+    normalized = resized.astype(np.float32) / 255.0
+    normalized = (normalized - 0.5) / 0.5
+    normalized = normalized.transpose(2, 0, 1)
+    padded = np.zeros((channels, target_height, target_width), dtype=np.float32)
+    padded[:, :, :resized_width] = normalized
+    return padded
+
+
+def decode_ctc_batch(logits: np.ndarray, characters: list[str]) -> list[tuple[str, float]]:
+    predictions = np.asarray(logits)
+    if predictions.ndim != 3:
+        raise RuntimeError(f"VN visa OCR output must be [batch,time,class], got {predictions.shape}")
+    expected_classes = len(characters) + 1
+    if predictions.shape[2] != expected_classes:
+        raise RuntimeError(
+            "VN visa OCR output/dictionary mismatch: "
+            f"model has {predictions.shape[2]} classes, dictionary expects {expected_classes}"
+        )
+    class_sums = predictions.sum(axis=2)
+    already_probabilities = (
+        float(predictions.min()) >= 0.0
+        and float(predictions.max()) <= 1.0
+        and float(np.mean(np.abs(class_sums - 1.0))) < 1e-3
+    )
+    probabilities = predictions if already_probabilities else softmax(predictions)
+    indices = probabilities.argmax(axis=2)
+    scores = probabilities.max(axis=2)
+    decoded: list[tuple[str, float]] = []
+    for row_indices, row_scores in zip(indices, scores, strict=False):
+        text_parts: list[str] = []
+        char_scores: list[float] = []
+        previous = -1
+        for class_index, score in zip(row_indices.tolist(), row_scores.tolist(), strict=False):
+            if class_index != 0 and class_index != previous:
+                dictionary_index = class_index - 1
+                if 0 <= dictionary_index < len(characters):
+                    text_parts.append(characters[dictionary_index])
+                    char_scores.append(float(score))
+            previous = class_index
+        confidence = sum(char_scores) / len(char_scores) if char_scores else 0.0
+        decoded.append(("".join(text_parts), confidence))
+    return decoded
+
+
+def softmax(values: np.ndarray) -> np.ndarray:
+    shifted = values - np.max(values, axis=2, keepdims=True)
+    exp_values = np.exp(shifted)
+    return exp_values / np.maximum(exp_values.sum(axis=2, keepdims=True), 1e-12)
+
 
 
 def model_class_names(model: Any) -> dict[int, str]:
