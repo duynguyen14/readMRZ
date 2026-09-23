@@ -428,7 +428,7 @@ class PaddleCtcTextRecognizer:
 
         config = paddle_infer.Config(str(self.model_file), str(self.params_file))
         configure_paddle_inference_device(config, device, self.cpu_threads)
-        if env_bool(env, "READMRZ_VN_VISA_READ_OCR_MEMORY_OPTIM", True):
+        if env_bool(env, "READMRZ_VN_VISA_READ_OCR_MEMORY_OPTIM", False):
             config.enable_memory_optim()
         config.disable_glog_info()
         self.predictor = paddle_infer.create_predictor(config)
