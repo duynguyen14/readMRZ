@@ -60,7 +60,7 @@ from .face_match import FaceMatchService
 from .file_type_classifier import FileTypeClassifier
 from .passport_face_batch import process_batch
 from .vn_visa_read_pipeline import VnVisaReadService
-from .vn_visa_standardize import standardize_vn_visa_read_payload
+from .vn_visa_standardize import get_vn_visa_standardizer, standardize_vn_visa_read_payload
 from .yolo_detector import YoloMrzDetector
 from .yolo_upload_pipeline import compact_yolo_read_payload, process_yolo_upload
 
@@ -367,6 +367,17 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         if env_bool(server_env, "READMRZ_VN_VISA_READ_WARMUP", False):
             warmup_ms = vn_visa_read_model.warmup()
             log_api(f"Warmed VN visa read service warmup_ms={warmup_ms}")
+
+    if env_bool(server_env, "READMRZ_VN_VISA_STANDARD_PRELOAD", True):
+        preload_started = time.perf_counter()
+        standardizer = get_vn_visa_standardizer()
+        log_api(
+            "Preloaded VN visa standardizer "
+            f"nationality_candidates={len(standardizer.nationality_candidates)} "
+            f"issue_place_candidates={len(standardizer.issue_place_candidates)} "
+            f"entries_candidates={len(standardizer.entries_candidates)} "
+            f"total_ms={int((time.perf_counter() - preload_started) * 1000)}"
+        )
 
     def validate_configured_api_key(payload: dict) -> None:
         if not api_key:
