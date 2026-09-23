@@ -393,7 +393,9 @@ class PaddleCtcTextRecognizer:
         self.model_dir = model_dir
         self.device = device
         self.cpu_threads = max(1, int(env_value(env, "READMRZ_VN_VISA_READ_OCR_CPU_THREADS", "4")))
-        self.model_file = first_existing(model_dir / "inference.json", model_dir / "inference.pdmodel")
+        # Prefer the legacy .pdmodel export when present. Some Paddle builds on
+        # Windows fail to initialize newer PIR inference.json models.
+        self.model_file = first_existing(model_dir / "inference.pdmodel", model_dir / "inference.json")
         self.params_file = model_dir / "inference.pdiparams"
         if self.model_file is None:
             raise FileNotFoundError(f"Missing inference.json or inference.pdmodel in OCR model dir: {model_dir}")
