@@ -23,6 +23,5 @@ def main() -> int:
     args = parser.parse_args()
     return run_server(args.port, host=args.host)
 
-
 if __name__ == "__main__":
     raise SystemExit(main())

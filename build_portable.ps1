@@ -12,8 +12,6 @@ python -m PyInstaller `
     --clean `
     --noconfirm `
     --name readmrz `
-    --collect-all rapidocr_onnxruntime `
-    --hidden-import rapidocr_onnxruntime `
     readmrz.py
 
 Write-Host "Portable build created at: $projectRoot\dist\readmrz\readmrz.exe"

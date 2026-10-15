@@ -1,11 +1,9 @@
 from __future__ import annotations
 
-import argparse
 import base64
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 from pathlib import Path
-import sys
 import threading
 import time
 from urllib.parse import parse_qs, urlparse
@@ -20,8 +18,6 @@ from .label_review import (
     get_previous_review_item,
     submit_review_decision,
 )
-from .mrz import parse_mrz, result_to_dict
-from .ocr import MrzOcrEngine
 from .ocr_line_review import (
     get_next_ocr_line_review_item,
     get_previous_ocr_line_review_item,
@@ -113,41 +109,6 @@ def log_api(message: str) -> None:
         pass
 
 
-def read_image(path: Path):
-    image = cv2.imread(str(path))
-    if image is None:
-        raise ValueError(f"Cannot read image: {path}")
-    return image
-
-
-def read_array(image, engine: MrzOcrEngine, *, input_name: str) -> dict:
-    started = time.perf_counter()
-    attempt = engine.read(image)
-    parse_started = time.perf_counter()
-    parsed = parse_mrz(attempt.lines)
-    parse_latency_ms = int((time.perf_counter() - parse_started) * 1000)
-    latency_ms = int((time.perf_counter() - started) * 1000)
-    payload = result_to_dict(
-        parsed,
-        raw_lines=attempt.lines,
-        ocr_score=attempt.ocr_score,
-        detector_score=attempt.detector_score,
-        latency_ms=latency_ms,
-        detector_latency_ms=attempt.detector_latency_ms,
-        ocr_latency_ms=attempt.ocr_latency_ms,
-        parse_latency_ms=parse_latency_ms,
-        candidates_evaluated=attempt.candidates_evaluated,
-        ocr_passes=attempt.ocr_passes,
-    )
-    payload["input"] = input_name
-    payload["engine"] = {
-        "detector": "opencv-mrz-heuristic",
-        "ocr": "rapidocr-onnxruntime-cpu",
-        "portable": True,
-    }
-    return payload
-
-
 def decode_image_bytes(data: bytes):
     arr = np.frombuffer(data, dtype=np.uint8)
     image = cv2.imdecode(arr, cv2.IMREAD_COLOR)
@@ -232,20 +193,12 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         f"max_http_threads={max_http_threads} "
         f"max_request_bytes={max_request_bytes}"
     )
-    engine: MrzOcrEngine | None = None
     yolo_detector: YoloMrzDetector | None = None
     document_orientation: PaddleDocumentOrientation | None = None
     custom_mrz_ocr: CustomMrzCtcRecognizer | None = None
     file_type_classifier: FileTypeClassifier | None = None
     face_matcher: FaceMatchService | None = None
     vn_visa_reader: VnVisaReadService | None = None
-
-    def get_engine() -> MrzOcrEngine:
-        nonlocal engine
-        if engine is None:
-            log_api("Loading MRZ OCR engine")
-            engine = MrzOcrEngine()
-        return engine
 
     def get_yolo_detector() -> YoloMrzDetector:
         nonlocal yolo_detector
@@ -1085,34 +1038,13 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(400, {"found": False, "boxes": [], "best_box": None, "error": str(exc)})
                 return
 
-            if parsed_url.path != "/read":
-                self.send_json(404, {"error": "Unknown route"})
-                return
-            try:
-                length = int(self.headers.get("Content-Length", "0"))
-                data = self.rfile.read(length)
-                content_type = self.headers.get("Content-Type", "")
-                image, input_name = decode_request_image(data, content_type)
-                log_api(f"READ start input={input_name} content_type={content_type} bytes={length}")
-                payload = read_array(image, get_engine(), input_name=input_name)
-                log_api(
-                    "READ done "
-                    f"input={input_name} found={payload['found']} "
-                    f"confidence={payload['confidence']} "
-                    f"detector_ms={payload['detector_latency_ms']} "
-                    f"ocr_ms={payload['ocr_latency_ms']} "
-                    f"parse_ms={payload['parse_latency_ms']} "
-                    f"total_ms={payload['latency_ms']}"
-                )
-                self.send_json(200 if payload["found"] else 422, payload)
-            except Exception as exc:
-                log_api(f"READ error {exc}")
-                self.send_json(400, {"found": False, "confidence": 0.0, "error": str(exc)})
+            self.send_json(404, {"error": "Unknown route"})
+            return
 
     server = LimitedThreadingHTTPServer((host, port), Handler, max_workers=max_http_threads)
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     log_api(f"READMRZ server listening on http://{display_host}:{port} bind={host}:{port}")
-    log_api("POST JSON {\"image_base64\":\"...\"} to /read")
+    log_api("MRZ read endpoint: POST /yolo-mrz-read-base64")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1120,67 +1052,3 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     finally:
         server.server_close()
     return 0
-
-
-def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(description="Read passport/visa MRZ from a PNG or JPG image.")
-    parser.add_argument("image", nargs="?", help="Input PNG/JPG image path")
-    parser.add_argument(
-        "-o",
-        "--output",
-        help="Optional JSON output path. If omitted, JSON is printed to stdout.",
-    )
-    parser.add_argument(
-        "--pretty",
-        action="store_true",
-        help="Pretty-print JSON output.",
-    )
-    parser.add_argument(
-        "--server",
-        type=int,
-        metavar="PORT",
-        help="Run a local HTTP server and keep the OCR model warm in memory.",
-    )
-    parser.add_argument(
-        "--host",
-        default="127.0.0.1",
-        help="Bind host for --server. Use 0.0.0.0 for LAN access.",
-    )
-    return parser
-
-
-def main(argv: list[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
-    if args.server:
-        return run_server(args.server, host=args.host)
-    if not args.image:
-        print("Missing image path. Use --help for usage.", file=sys.stderr)
-        return 1
-    started = time.perf_counter()
-    image_path = Path(args.image)
-    try:
-        image = read_image(image_path)
-        engine = MrzOcrEngine()
-        payload = read_array(image, engine, input_name=str(image_path))
-        payload["latency_ms"] = int((time.perf_counter() - started) * 1000)
-        json_text = json.dumps(payload, ensure_ascii=False, indent=2 if args.pretty else None)
-        if args.output:
-            Path(args.output).write_text(json_text, encoding="utf-8")
-        else:
-            print(json_text)
-        return 0 if payload["found"] else 2
-    except Exception as exc:
-        latency_ms = int((time.perf_counter() - started) * 1000)
-        error_payload = {
-            "found": False,
-            "input": str(image_path),
-            "confidence": 0.0,
-            "latency_ms": latency_ms,
-            "error": str(exc),
-        }
-        print(json.dumps(error_payload, ensure_ascii=False), file=sys.stderr)
-        return 1
-
-
-if __name__ == "__main__":
-    raise SystemExit(main())

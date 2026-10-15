@@ -1,6 +1,6 @@
 # READMRZ
 
-CPU-only MRZ reader for passport and visa images.
+MRZ and Vietnamese visa reader for passport and visa images.
 
 ## Run
 
@@ -19,28 +19,23 @@ READMRZ_API_PORT=8080
 
 On the same machine, call `http://127.0.0.1:8080`. From LAN, call `http://<server-lan-ip>:8080`.
 
-```powershell
-python -m mrz_reader.cli "path\to\passport.jpg" --pretty
-```
-
 Portable build target:
 
 ```powershell
 .\build_portable.ps1
-.\dist\readmrz\readmrz.exe "path\to\passport.jpg" --pretty
+.\dist\readmrz\readmrz.exe
 ```
 
 No-setup portable usage after build:
 
 ```powershell
-.\read_image.bat "path\to\passport.jpg"
 .\run_server.bat
 ```
 
 Server mode keeps the OCR model loaded in RAM:
 
 ```powershell
-.\dist\readmrz\readmrz.exe --server 8080
+.\dist\readmrz\readmrz.exe --port 8080
 ```
 
 Then send a base64 image:
@@ -48,7 +43,7 @@ Then send a base64 image:
 ```powershell
 $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("path\to\passport.jpg"))
 $body = @{ image_base64 = $b64; filename = "passport.jpg" } | ConvertTo-Json
-Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/read -Body $body -ContentType "application/json"
+Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/yolo-mrz-read-base64 -Body $body -ContentType "application/json"
 ```
 
 Face match uses InsightFace model packs: SCRFD for face detection and ArcFace for recognition. Face match 1-1 keeps the same request/response shape as the older backend:
@@ -143,14 +138,14 @@ The tool returns JSON with:
 
 ```text
 PNG/JPG
--> OpenCV MRZ candidate detector
--> RapidOCR ONNX Runtime CPU OCR
+-> document orientation normalization
+-> YOLO MRZ detector
+-> OpenCV crop, deskew and line splitting
+-> custom CTC MRZ recognizer
 -> MRZ charset normalization
 -> ICAO-style format parsing and checksum validation
 -> JSON output
 ```
-
-The CLI interface is stable so the OCR model can later be replaced with a fine-tuned MRZ ONNX model without changing callers.
 
 ## Generate YOLO MRZ Labels
 
@@ -190,7 +185,7 @@ generated_datasets/mrz_yolo/
   last_run_summary.json
 ```
 
-The script uses RapidOCR/PaddleOCR text boxes to find MRZ-like lines and writes one YOLO label per detected MRZ block. Images and labels are written one by one; `processed.json` metadata is flushed in batches controlled by `READMRZ_PROCESSED_BATCH_SIZE`. Review the generated boxes before using them as final detector training data.
+The script uses PaddleOCR text boxes to find MRZ-like lines and writes one YOLO label per detected MRZ block. Images and labels are written one by one; `processed.json` metadata is flushed in batches controlled by `READMRZ_PROCESSED_BATCH_SIZE`. Review the generated boxes before using them as final detector training data.
 
 ## Review YOLO MRZ Labels
 

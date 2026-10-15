@@ -1,11 +1,7 @@
 # -*- mode: python ; coding: utf-8 -*-
-from PyInstaller.utils.hooks import collect_all
-
 datas = []
 binaries = []
-hiddenimports = ['rapidocr_onnxruntime']
-tmp_ret = collect_all('rapidocr_onnxruntime')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+hiddenimports = []
 
 
 a = Analysis(

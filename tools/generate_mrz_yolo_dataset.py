@@ -94,45 +94,6 @@ def read_local_model_name(model_dir: Path) -> str | None:
     return None
 
 
-class RapidOcrAdapter:
-    name = "rapidocr_onnxruntime"
-
-    def __init__(self, env: dict[str, str]) -> None:
-        from rapidocr_onnxruntime import RapidOCR
-
-        kwargs: dict[str, Any] = {
-            "text_score": env_float(env, "READMRZ_MIN_OCR_SCORE", 0.35),
-            "use_angle_cls": False,
-            "print_verbose": False,
-        }
-
-        model_env_map = {
-            "READMRZ_DET_MODEL_PATH": "det_model_path",
-            "READMRZ_REC_MODEL_PATH": "rec_model_path",
-            "READMRZ_CLS_MODEL_PATH": "cls_model_path",
-        }
-        for env_key, kwarg_key in model_env_map.items():
-            model_path = env_value(env, env_key)
-            if model_path:
-                kwargs[kwarg_key] = model_path
-
-        self.kwargs = kwargs
-        self.pipeline = RapidOCR(**kwargs)
-
-    def config_summary(self) -> dict[str, Any]:
-        return dict(self.kwargs)
-
-    def predict_rows(self, image_path: Path, image: np.ndarray) -> list[dict[str, Any]]:
-        height, width = image.shape[:2]
-        result, _ = self.pipeline(image)
-        rows: list[dict[str, Any]] = []
-        for raw_row in result or []:
-            row = row_from_rapidocr(raw_row, height, width)
-            if row is not None:
-                rows.append(row)
-        return rows
-
-
 class PaddleOcrAdapter:
     name = "paddleocr"
 
@@ -233,11 +194,9 @@ class PaddleOcrAdapter:
 
 def build_ocr(env: dict[str, str]) -> Any:
     engine = env_value(env, "READMRZ_OCR_ENGINE", "paddle").strip().lower()
-    if engine == "rapidocr":
-        return RapidOcrAdapter(env)
     if engine == "paddle":
         return PaddleOcrAdapter(env)
-    raise ValueError("READMRZ_OCR_ENGINE must be 'paddle' or 'rapidocr'")
+    raise ValueError("READMRZ_OCR_ENGINE must be 'paddle'")
 
 
 def maybe_reexec_with_paddle_python(env: dict[str, str]) -> int | None:
@@ -261,33 +220,6 @@ def maybe_reexec_with_paddle_python(env: dict[str, str]) -> int | None:
     print(f"PaddleOCR is not installed in {current_python}")
     print(f"Re-running with Paddle Python: {python_path}")
     return subprocess.run(command, cwd=str(PROJECT_ROOT), check=False).returncode
-
-
-def build_rapid_ocr(env: dict[str, str]) -> Any:
-    # Kept for backward compatibility with older imports.
-    return RapidOcrAdapter(env)
-
-
-def _legacy_build_rapidocr(env: dict[str, str]) -> Any:
-    from rapidocr_onnxruntime import RapidOCR
-
-    kwargs: dict[str, Any] = {
-        "text_score": env_float(env, "READMRZ_MIN_OCR_SCORE", 0.35),
-        "use_angle_cls": False,
-        "print_verbose": False,
-    }
-
-    model_env_map = {
-        "READMRZ_DET_MODEL_PATH": "det_model_path",
-        "READMRZ_REC_MODEL_PATH": "rec_model_path",
-        "READMRZ_CLS_MODEL_PATH": "cls_model_path",
-    }
-    for env_key, kwarg_key in model_env_map.items():
-        model_path = env_value(env, env_key)
-        if model_path:
-            kwargs[kwarg_key] = model_path
-
-    return RapidOCR(**kwargs)
 
 
 def list_images(source_dir: Path, *, output_dir: Path) -> list[Path]:
@@ -480,25 +412,6 @@ def build_row_from_points(
         "bottom_bias": y_center / max(1, image_height),
         "width_ratio": width / max(1, image_width),
     }
-
-
-def row_from_rapidocr(raw_row: Any, image_height: int, image_width: int) -> dict[str, Any] | None:
-    if len(raw_row) < 3:
-        return None
-    text = str(raw_row[1])
-
-    try:
-        points = normalize_points(raw_row[0])
-    except Exception:
-        return None
-
-    return build_row_from_points(
-        text=text,
-        score=float(raw_row[2]),
-        points=points,
-        image_height=image_height,
-        image_width=image_width,
-    )
 
 
 def row_from_paddleocr(
@@ -749,7 +662,7 @@ def write_data_yaml(output_dir: Path) -> None:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Generate YOLO MRZ pseudo-labels using RapidOCR/PaddleOCR text boxes."
+        description="Generate YOLO MRZ pseudo-labels using PaddleOCR text boxes."
     )
     parser.add_argument("--env", default=str(PROJECT_ROOT / ".env"), help="Path to .env config file.")
     parser.add_argument("--force", action="store_true", help="Reprocess images even if processed.json says they are done.")
