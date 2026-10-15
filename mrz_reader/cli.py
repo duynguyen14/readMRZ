@@ -53,8 +53,20 @@ from .document_orientation import PaddleDocumentOrientation, env_bool
 from .custom_mrz_ocr import CustomMrzCtcRecognizer
 from .env_config import env_value, read_env_file
 from .face_match import FaceMatchService
+from .face_match_job_queue import (
+    FaceMatchItemNotFoundError,
+    FaceMatchJobNotFoundError,
+    FaceMatchJobRepository,
+    FaceMatchJobWorker,
+)
 from .file_type_classifier import FileTypeClassifier
-from .passport_face_batch import process_batch
+from .image_payload import ImagePayload, resize_for_inference
+from .passport_face_batch import (
+    build_face_candidate,
+    build_passport_candidate,
+    normalize_class_label,
+    process_batch,
+)
 from .passport_batch_queue import (
     BatchNotFoundError,
     ItemNotFoundError,
@@ -382,6 +394,134 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             ),
         )
 
+    face_match_job_repository = FaceMatchJobRepository.from_env(server_env)
+    face_match_job_worker: FaceMatchJobWorker | None = None
+
+    def process_face_match_job_image(
+        image_bytes: bytes,
+        file_name: str,
+        content_type: str,
+    ) -> tuple[dict, np.ndarray, int, int]:
+        acquired = inference_limit.acquire(timeout=inference_queue_timeout)
+        if not acquired:
+            raise TimeoutError("Inference queue timeout")
+        try:
+            image = decode_image_bytes(image_bytes)
+            height, width = image.shape[:2]
+            payload = ImagePayload(
+                file_name=Path(file_name).name,
+                content_type=content_type or "application/octet-stream",
+                base64_value="",
+                file_bytes=image_bytes,
+                image=image,
+                width=int(width),
+                height=int(height),
+            )
+            max_side = max(
+                0,
+                int(env_value(server_env, "READMRZ_INFERENCE_MAX_IMAGE_SIDE", "1600")),
+            )
+            working = resize_for_inference(image, max_side)
+            raw_classification = get_file_type_classifier().predict(working.image)
+            raw_label = str(raw_classification.get("label") or "")
+            normalized_label = normalize_class_label(raw_label)
+            if normalized_label not in {"face", "passport"}:
+                normalized_label = "unknown"
+            classification = {
+                **raw_classification,
+                "label": normalized_label,
+                "raw_label": raw_label,
+            }
+
+            if normalized_label == "face":
+                candidate = build_face_candidate(
+                    payload,
+                    working,
+                    classification,
+                    get_face_matcher(),
+                    log_api,
+                )
+                detections = candidate.detections
+                result = dict(candidate.response)
+            elif normalized_label == "passport":
+                candidate = build_passport_candidate(
+                    payload,
+                    working,
+                    classification,
+                    get_face_matcher(),
+                    get_yolo_detector(),
+                    get_document_orientation(),
+                    get_custom_mrz_ocr(),
+                    log_api,
+                )
+                detections = candidate.detections
+                result = dict(candidate.response)
+            else:
+                detections = []
+                result = {
+                    "file_name": payload.file_name,
+                    "content_type": payload.content_type,
+                    "classification": {
+                        "label": "unknown",
+                        "raw_label": raw_label,
+                        "confidence": round(float(classification.get("confidence") or 0.0), 6),
+                    },
+                    "image": {
+                        "width": payload.width,
+                        "height": payload.height,
+                        "resized_for_inference": working.resized,
+                    },
+                    "detected": False,
+                    "face_count": 0,
+                }
+
+            result.pop("base64", None)
+            result.pop("face_base64", None)
+            result.pop("face_content_type", None)
+            result["classification"] = {
+                "label": normalized_label,
+                "raw_label": raw_label,
+                "confidence": round(float(classification.get("confidence") or 0.0), 6),
+            }
+            result["face_count"] = len(detections)
+            result["embedding_candidates"] = [
+                {
+                    "index": index,
+                    "bbox": detection.bbox,
+                    "confidence": round(float(detection.confidence), 6),
+                    "selection_score": round(float(detection.selection_score), 6),
+                    "selection_reason": detection.selection_reason,
+                }
+                for index, detection in enumerate(detections)
+            ]
+            embeddings = (
+                np.stack(
+                    [np.asarray(detection.embedding, dtype=np.float32) for detection in detections],
+                    axis=0,
+                )
+                if detections
+                else np.empty((0, 0), dtype=np.float32)
+            )
+            return result, embeddings, int(width), int(height)
+        finally:
+            inference_limit.release()
+
+    if env_bool(server_env, "READMRZ_FACE_MATCH_JOB_WORKER_ENABLED", True):
+        face_match_job_worker = FaceMatchJobWorker(
+            face_match_job_repository,
+            process_face_match_job_image,
+            logger=log_api,
+            poll_seconds=float(
+                env_value(server_env, "READMRZ_FACE_MATCH_JOB_POLL_SECONDS", "1")
+            ),
+            retry_delay_seconds=int(
+                env_value(server_env, "READMRZ_FACE_MATCH_JOB_RETRY_DELAY_SECONDS", "30")
+            ),
+            lock_timeout_seconds=int(
+                env_value(server_env, "READMRZ_FACE_MATCH_JOB_LOCK_TIMEOUT_SECONDS", "900")
+            ),
+        )
+
     def validate_configured_api_key(payload: dict) -> None:
         if not api_key:
             raise PermissionError("READMRZ_API_KEY is not configured")
@@ -469,6 +609,118 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 return
             normalized_path = parsed_url.path.rstrip("/") or "/"
             path_parts = [part for part in normalized_path.split("/") if part]
+
+            if normalized_path == "/api/passport-face-match/jobs":
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = face_match_job_repository.list_jobs(
+                        status=params.get("status", [""])[0],
+                        keyword=params.get("keyword", [""])[0],
+                        page=int(params.get("page", ["1"])[0] or "1"),
+                        page_size=int(params.get("page_size", ["20"])[0] or "20"),
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"FACE_MATCH_JOB_LIST error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 6
+                and path_parts[0:3] == ["api", "passport-face-match", "jobs"]
+                and path_parts[3] == "items"
+                and path_parts[5] == "image"
+            ):
+                try:
+                    self.validate_read_api_key()
+                    image = face_match_job_repository.get_item_image(path_parts[4])
+                    self.send_file(image["path"], image["content_type"], image["file_name"])
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except (FaceMatchItemNotFoundError, FileNotFoundError) as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"FACE_MATCH_JOB_IMAGE error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 5
+                and path_parts[0:3] == ["api", "passport-face-match", "jobs"]
+                and path_parts[4] == "items"
+            ):
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = face_match_job_repository.list_items(
+                        path_parts[3],
+                        status=params.get("status", [""])[0],
+                        classification=params.get("classification", [""])[0],
+                        page=int(params.get("page", ["1"])[0] or "1"),
+                        page_size=int(params.get("page_size", ["50"])[0] or "50"),
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except FaceMatchJobNotFoundError as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"FACE_MATCH_JOB_ITEMS error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 5
+                and path_parts[0:3] == ["api", "passport-face-match", "jobs"]
+                and path_parts[4] == "pairs"
+            ):
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = face_match_job_repository.list_pairs(
+                        path_parts[3],
+                        decision=params.get("decision", [""])[0],
+                        page=int(params.get("page", ["1"])[0] or "1"),
+                        page_size=int(params.get("page_size", ["50"])[0] or "50"),
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except FaceMatchJobNotFoundError as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"FACE_MATCH_JOB_PAIRS error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 4
+                and path_parts[0:3] == ["api", "passport-face-match", "jobs"]
+            ):
+                try:
+                    self.validate_read_api_key()
+                    self.send_json(200, face_match_job_repository.get_job(path_parts[3]))
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except FaceMatchJobNotFoundError as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"FACE_MATCH_JOB_DETAIL error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
 
             if normalized_path == "/api/passport-batches":
                 try:
@@ -677,6 +929,100 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         def do_POST(self) -> None:
             log_api(f"POST {self.path}")
             parsed_url = urlparse(self.path)
+            if parsed_url.path.rstrip("/") == "/api/passport-face-match/jobs":
+                try:
+                    content_type = self.headers.get("Content-Type", "")
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0:
+                        raise ValueError("Request body is empty")
+                    job_max_request_bytes = max(
+                        1024,
+                        int(
+                            env_value(
+                                server_env,
+                                "READMRZ_FACE_MATCH_JOB_MAX_REQUEST_BYTES",
+                                str(max_request_bytes),
+                            )
+                        ),
+                    )
+                    if length > job_max_request_bytes:
+                        self.send_json(
+                            413,
+                            {
+                                "status": "error",
+                                "error": (
+                                    "Request body is too large. "
+                                    f"Max allowed is {job_max_request_bytes} bytes."
+                                ),
+                            },
+                        )
+                        return
+                    files, fields = parse_multipart_form(content_type, self.rfile.read(length))
+                    if api_key:
+                        provided_key = str(
+                            self.headers.get("X-API-Key")
+                            or fields.get("api_key")
+                            or fields.get("key")
+                            or ""
+                        ).strip()
+                        if provided_key != api_key:
+                            raise PermissionError("Invalid API key")
+
+                    metadata = None
+                    metadata_text = fields.get("metadata_json") or fields.get("metadata")
+                    if metadata_text:
+                        metadata = json.loads(metadata_text)
+                        if not isinstance(metadata, dict):
+                            raise ValueError("metadata_json must contain a JSON object")
+
+                    default_match_threshold = float(
+                        env_value(
+                            server_env,
+                            "INSIGHTFACE_MATCH_THRESHOLD",
+                            env_value(server_env, "FACE_MATCH_MATCH_THRESHOLD", "0.45"),
+                        )
+                    )
+                    default_review_threshold = float(
+                        env_value(
+                            server_env,
+                            "INSIGHTFACE_REVIEW_THRESHOLD",
+                            env_value(server_env, "FACE_MATCH_REVIEW_THRESHOLD", "0.35"),
+                        )
+                    )
+                    result = face_match_job_repository.create_job(
+                        files,
+                        match_threshold=float(
+                            fields.get("match_threshold") or default_match_threshold
+                        ),
+                        review_threshold=float(
+                            fields.get("review_threshold") or default_review_threshold
+                        ),
+                        client_request_id=(
+                            fields.get("client_request_id")
+                            or self.headers.get("X-Client-Request-Id")
+                        ),
+                        source_system=fields.get("source_system"),
+                        requested_by=fields.get("requested_by"),
+                        metadata=metadata,
+                    )
+                    if face_match_job_worker is not None:
+                        face_match_job_worker.wake()
+                    log_api(
+                        "FACE_MATCH_JOB_UPLOAD accepted "
+                        f"job_id={result['job_id']} received={result['received']}"
+                    )
+                    self.send_json(202, result)
+                except PermissionError as exc:
+                    log_api(f"FACE_MATCH_JOB_UPLOAD auth_error {exc}")
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except (ValueError, json.JSONDecodeError) as exc:
+                    log_api(f"FACE_MATCH_JOB_UPLOAD bad_request {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"FACE_MATCH_JOB_UPLOAD error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
             if parsed_url.path.rstrip("/") == "/api/passport-batches/items/review":
                 try:
                     payload = self.read_json_body()
@@ -1337,11 +1683,15 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     server = LimitedThreadingHTTPServer((host, port), Handler, max_workers=max_http_threads)
     if passport_batch_worker is not None:
         passport_batch_worker.start()
+    if face_match_job_worker is not None:
+        face_match_job_worker.start()
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     log_api(f"READMRZ server listening on http://{display_host}:{port} bind={host}:{port}")
     log_api("MRZ read endpoint: POST /yolo-mrz-read-base64")
     log_api("Passport batch upload endpoint: POST /api/passport-batches")
     log_api("Passport batch query endpoint: GET /api/passport-batches")
+    log_api("Async face match upload endpoint: POST /api/passport-face-match/jobs")
+    log_api("Async face match query endpoint: GET /api/passport-face-match/jobs/{job_id}")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -1349,5 +1699,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     finally:
         if passport_batch_worker is not None:
             passport_batch_worker.stop()
+        if face_match_job_worker is not None:
+            face_match_job_worker.stop()
         server.server_close()
     return 0

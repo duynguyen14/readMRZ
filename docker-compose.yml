@@ -10,6 +10,7 @@ services:
       READMRZ_API_HOST: 0.0.0.0
       READMRZ_API_PORT: "${READMRZ_API_PORT:-8080}"
       READMRZ_PASSPORT_BATCH_STORAGE_DIR: /app/passport_batches
+      READMRZ_FACE_MATCH_JOB_STORAGE_DIR: /app/face_match_jobs
       READMRZ_DB_DRIVER: "ODBC Driver 18 for SQL Server"
       SQLSERVER_DRIVER: "ODBC Driver 18 for SQL Server"
       READMRZ_YOLO_DEVICE: cpu
@@ -66,6 +67,7 @@ services:
       - ${READMRZ_DOCKER_GENERATED_DATASETS_DIR:-./generated_datasets}:/app/generated_datasets
       - ${READMRZ_DOCKER_IMAGES_DIR:-./images}:/app/images:ro
       - ${READMRZ_DOCKER_PASSPORT_BATCH_DIR:-./passport_batches}:/app/passport_batches
+      - ${READMRZ_DOCKER_FACE_MATCH_JOB_DIR:-./face_match_jobs}:/app/face_match_jobs
       - ${READMRZ_DOCKER_VN_VISA_INPUT_DIR:-./vn_visa_input}:/app/vn_visa_input:ro
       - ${READMRZ_DOCKER_VN_VISA_ORIENTED_DIR:-./vn_visa_oriented}:/app/vn_visa_oriented:ro
       - ${READMRZ_DOCKER_VN_VISA_COLAB_EXPORT_DIR:-./vn_visa_colab_export}:/app/vn_visa_colab_export:ro

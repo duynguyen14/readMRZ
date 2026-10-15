@@ -202,6 +202,50 @@ POST http://127.0.0.1:8080/api/passport-face-match/batch
 
 Unmatched input is still returned as `{ "face": {...}, "passport": null }` or `{ "face": null, "passport": {...} }`.
 
+## Async face/passport matching jobs
+
+The existing synchronous batch endpoint above is unchanged. For large mixed uploads, create
+the SQL tables once with `sql/create_face_match_job_tables.sql`, then send image parts to the
+new multipart endpoint. There is no item-count limit in the API; the total request is bounded
+by `READMRZ_FACE_MATCH_JOB_MAX_REQUEST_BYTES`.
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8080/api/passport-face-match/jobs" `
+  -H "X-API-Key: YOUR_KEY" `
+  -F "files=@C:\images\face-001.jpg" `
+  -F "files=@C:\images\passport-001.jpg" `
+  -F "client_request_id=face-match-20261015-001" `
+  -F "source_system=batch-import"
+```
+
+The API returns HTTP 202 after the original files and queue rows are persisted:
+
+```json
+{
+  "job_id": "fa9a308e-cb81-4027-8941-794409701af8",
+  "status": "queued",
+  "received": 2
+}
+```
+
+The worker classifies every image as `face`, `passport` or `unknown`, extracts face embeddings,
+runs the existing MRZ pipeline for passport pages, and stores embeddings as compact `.npy`
+files. Once extraction reaches the barrier, it computes a cosine-similarity matrix and applies
+Hungarian global one-to-one assignment. Scores at or above the match threshold are `match`;
+scores between the review and match thresholds are `review`; the rest remain unmatched.
+
+```text
+GET /api/passport-face-match/jobs?status=completed&page=1&page_size=20
+GET /api/passport-face-match/jobs/{job_id}
+GET /api/passport-face-match/jobs/{job_id}/items?status=succeeded&classification=passport
+GET /api/passport-face-match/jobs/{job_id}/pairs?decision=match
+GET /api/passport-face-match/jobs/items/{item_key}/image
+```
+
+Optional multipart fields `match_threshold` and `review_threshold` override the configured
+InsightFace thresholds for that job. Original images and embeddings must live on persistent
+storage; Docker Compose mounts `READMRZ_DOCKER_FACE_MATCH_JOB_DIR` for this purpose.
+
 The API also accepts data URLs:
 
 ```json

@@ -10,6 +10,9 @@ build/
 dist/
 tools/images/
 tools/labels/
+tmp/
+passport_batches/
+face_match_jobs/
 
 # Local IDE/runtime folders
 .idea/
