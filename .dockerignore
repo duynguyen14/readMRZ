@@ -11,6 +11,7 @@ datasets
 generated_datasets
 models
 tmp_debug
+passport_batches
 images
 vn_visa_input
 vn_visa_oriented

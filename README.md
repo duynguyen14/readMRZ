@@ -46,6 +46,97 @@ $body = @{ image_base64 = $b64; filename = "passport.jpg" } | ConvertTo-Json
 Invoke-RestMethod -Method Post -Uri http://127.0.0.1:8080/yolo-mrz-read-base64 -Body $body -ContentType "application/json"
 ```
 
+## Async passport batch upload
+
+Create the SQL tables once with `sql/create_passport_batch_tables.sql`, then configure the
+storage and worker settings from `.env`. Upload one or many image parts named `files`:
+
+```powershell
+curl.exe -X POST "http://127.0.0.1:8080/api/passport-batches" `
+  -H "X-API-Key: YOUR_KEY" `
+  -F "files=@C:\images\passport-001.jpg" `
+  -F "files=@C:\images\passport-002.jpg" `
+  -F "client_request_id=import-20261015-001" `
+  -F "source_system=passport-import"
+```
+
+The API persists the files and queue rows, then responds without waiting for OCR:
+
+```json
+{
+  "batch_id": "9e884bd5-ef8f-4339-8244-94e9fe15dc07",
+  "received": 2,
+  "status": "queued"
+}
+```
+
+The background worker claims rows atomically, runs the existing document orientation,
+YOLO MRZ, crop/line split, OCR and ICAO parsing pipeline, and writes each result back to
+`dbo.readmrz_passport_items`. Batch counters and terminal status are maintained in
+`dbo.readmrz_passport_batches`. Items left in `processing` by an interrupted process are
+returned to the queue after the configured lock timeout.
+
+This endpoint accepts any number of file parts, subject to
+`READMRZ_PASSPORT_BATCH_MAX_REQUEST_BYTES`. For a very large import, send several batches
+so the HTTP request body does not need to be held in memory at once.
+
+### Browse batches and review-ready items
+
+List batches with optional status, keyword, paging and sort filters:
+
+```text
+GET /api/passport-batches?status=completed&page=1&page_size=20&sort=created_desc
+```
+
+List items in one batch. Both processing and review status can be filtered:
+
+```text
+GET /api/passport-batches/{batch_id}/items?status=succeeded&review_status=pending&page=1&page_size=50
+```
+
+Navigate through successfully processed items that are still pending review:
+
+```text
+GET /api/passport-batches/{batch_id}/review/next
+GET /api/passport-batches/{batch_id}/review/next?current_item_key={item_key}
+GET /api/passport-batches/{batch_id}/review/previous?current_item_key={item_key}
+```
+
+The initial `next` request returns the most recently processed pending item. Navigation
+uses `ProcessedAt` and item ID as a stable cursor. A response with `"item": null` means
+there is no matching item in that direction.
+
+Preview the original image without embedding large base64 values in list responses:
+
+```text
+GET /api/passport-batches/items/{item_key}/image
+```
+
+Submit a review decision after the user has checked an item:
+
+```text
+POST /api/passport-batches/items/review
+Content-Type: application/json
+```
+
+```json
+{
+  "id": "6c9b9bf1-2874-4a61-a5b1-1130dc00ac3e",
+  "status": "approved",
+  "reviewed_by": "operator-01",
+  "note": "Optional review note"
+}
+```
+
+`id` accepts either the numeric database item ID or public `item_key` UUID. The accepted
+decisions are `approved`, `corrected` and `rejected`. Only successfully processed items
+can be reviewed; other processing states return HTTP 409. The response contains the
+updated item and refreshed batch statistics.
+
+Batch and item-list responses include processing and review statistics. `reviewed` is the
+sum of approved, corrected and rejected items; `unreviewed` is the number of pending items.
+When `READMRZ_API_KEY` is configured, send it in the `X-API-Key` header for these routes.
+
 Face match uses InsightFace model packs: SCRFD for face detection and ArcFace for recognition. Face match 1-1 keeps the same request/response shape as the older backend:
 
 ```text

@@ -55,6 +55,14 @@ from .env_config import env_value, read_env_file
 from .face_match import FaceMatchService
 from .file_type_classifier import FileTypeClassifier
 from .passport_face_batch import process_batch
+from .passport_batch_queue import (
+    BatchNotFoundError,
+    ItemNotFoundError,
+    PassportBatchRepository,
+    PassportBatchWorker,
+    ReviewConflictError,
+    parse_multipart_form,
+)
 from .vn_visa_read_pipeline import VnVisaReadService
 from .vn_visa_standardize import get_vn_visa_standardizer, standardize_vn_visa_read_payload
 from .yolo_detector import YoloMrzDetector
@@ -181,6 +189,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         int(env_value(server_env, "READMRZ_API_MAX_HTTP_THREADS", "8")),
     )
     inference_limit = threading.Semaphore(inference_concurrency)
+    model_load_lock = threading.RLock()
     api_key = (
         env_value(server_env, "READMRZ_API_KEY", "").strip()
         or env_value(server_env, "PASSPORT_INFERENCE_API_KEY", "").strip()
@@ -203,31 +212,37 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     def get_yolo_detector() -> YoloMrzDetector:
         nonlocal yolo_detector
         if yolo_detector is None:
-            log_api("Loading MRZ YOLO detector")
-            yolo_detector = YoloMrzDetector()
-            log_api(f"Loaded MRZ YOLO detector model_load_ms={yolo_detector.load_ms}")
+            with model_load_lock:
+                if yolo_detector is None:
+                    log_api("Loading MRZ YOLO detector")
+                    yolo_detector = YoloMrzDetector()
+                    log_api(f"Loaded MRZ YOLO detector model_load_ms={yolo_detector.load_ms}")
         return yolo_detector
 
     def get_document_orientation() -> PaddleDocumentOrientation:
         nonlocal document_orientation
         if document_orientation is None:
-            log_api("Loading Paddle document orientation model")
-            document_orientation = PaddleDocumentOrientation()
-            log_api(
-                "Loaded Paddle document orientation model "
-                f"enabled={document_orientation.enabled} model_load_ms={document_orientation.load_ms}"
-            )
+            with model_load_lock:
+                if document_orientation is None:
+                    log_api("Loading Paddle document orientation model")
+                    document_orientation = PaddleDocumentOrientation()
+                    log_api(
+                        "Loaded Paddle document orientation model "
+                        f"enabled={document_orientation.enabled} model_load_ms={document_orientation.load_ms}"
+                    )
         return document_orientation
 
     def get_custom_mrz_ocr() -> CustomMrzCtcRecognizer:
         nonlocal custom_mrz_ocr
         if custom_mrz_ocr is None:
-            log_api("Loading custom MRZ CTC recognizer")
-            custom_mrz_ocr = CustomMrzCtcRecognizer()
-            log_api(
-                "Loaded custom MRZ CTC recognizer "
-                f"enabled={custom_mrz_ocr.enabled} model_load_ms={custom_mrz_ocr.load_ms}"
-            )
+            with model_load_lock:
+                if custom_mrz_ocr is None:
+                    log_api("Loading custom MRZ CTC recognizer")
+                    custom_mrz_ocr = CustomMrzCtcRecognizer()
+                    log_api(
+                        "Loaded custom MRZ CTC recognizer "
+                        f"enabled={custom_mrz_ocr.enabled} model_load_ms={custom_mrz_ocr.load_ms}"
+                    )
         return custom_mrz_ocr
 
     def get_file_type_classifier() -> FileTypeClassifier:
@@ -332,6 +347,41 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             f"total_ms={int((time.perf_counter() - preload_started) * 1000)}"
         )
 
+    passport_batch_repository = PassportBatchRepository.from_env(server_env)
+    passport_batch_worker: PassportBatchWorker | None = None
+
+    def process_passport_batch_image(image: np.ndarray) -> tuple[dict, dict]:
+        acquired = inference_limit.acquire(timeout=inference_queue_timeout)
+        if not acquired:
+            raise TimeoutError("Inference queue timeout")
+        try:
+            debug_payload = process_yolo_upload(
+                image,
+                get_yolo_detector(),
+                get_document_orientation(),
+                get_custom_mrz_ocr(),
+                include_images=False,
+            )
+            return compact_yolo_read_payload(debug_payload), debug_payload
+        finally:
+            inference_limit.release()
+
+    if env_bool(server_env, "READMRZ_PASSPORT_BATCH_WORKER_ENABLED", True):
+        passport_batch_worker = PassportBatchWorker(
+            passport_batch_repository,
+            process_passport_batch_image,
+            logger=log_api,
+            poll_seconds=float(
+                env_value(server_env, "READMRZ_PASSPORT_BATCH_POLL_SECONDS", "1")
+            ),
+            retry_delay_seconds=int(
+                env_value(server_env, "READMRZ_PASSPORT_BATCH_RETRY_DELAY_SECONDS", "30")
+            ),
+            lock_timeout_seconds=int(
+                env_value(server_env, "READMRZ_PASSPORT_BATCH_LOCK_TIMEOUT_SECONDS", "900")
+            ),
+        )
+
     def validate_configured_api_key(payload: dict) -> None:
         if not api_key:
             raise PermissionError("READMRZ_API_KEY is not configured")
@@ -349,7 +399,10 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             self.send_header("Content-Type", "application/json; charset=utf-8")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, X-API-Key, X-Client-Request-Id",
+            )
             self.send_header("Content-Length", str(len(body)))
             self.end_headers()
             self.wfile.write(body)
@@ -368,6 +421,30 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             data = self.rfile.read(length)
             return json.loads(data.decode("utf-8")) if data else {}
 
+        def validate_read_api_key(self) -> None:
+            if not api_key:
+                return
+            provided = str(self.headers.get("X-API-Key") or "").strip()
+            if provided != api_key:
+                raise PermissionError("Invalid API key")
+
+        def send_file(self, path: Path, content_type: str, file_name: str) -> None:
+            safe_name = Path(str(file_name).replace("\\", "/")).name.replace('"', "")
+            file_size = path.stat().st_size
+            self.send_response(200)
+            self.send_header("Content-Type", content_type or "application/octet-stream")
+            self.send_header("Content-Length", str(file_size))
+            self.send_header("Content-Disposition", f'inline; filename="{safe_name}"')
+            self.send_header("Cache-Control", "private, max-age=300")
+            self.send_header("Access-Control-Allow-Origin", "*")
+            self.end_headers()
+            with path.open("rb") as source:
+                while True:
+                    chunk = source.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    self.wfile.write(chunk)
+
         def acquire_inference_slot(self) -> bool:
             return inference_limit.acquire(timeout=inference_queue_timeout)
 
@@ -376,7 +453,10 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             self.send_response(204)
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Access-Control-Allow-Methods", "GET, POST, OPTIONS")
-            self.send_header("Access-Control-Allow-Headers", "Content-Type")
+            self.send_header(
+                "Access-Control-Allow-Headers",
+                "Content-Type, X-API-Key, X-Client-Request-Id",
+            )
             self.send_header("Access-Control-Max-Age", "86400")
             self.send_header("Content-Length", "0")
             self.end_headers()
@@ -386,6 +466,107 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             parsed_url = urlparse(self.path)
             if parsed_url.path == "/health":
                 self.send_json(200, {"ok": True, "engine": "readmrz"})
+                return
+            normalized_path = parsed_url.path.rstrip("/") or "/"
+            path_parts = [part for part in normalized_path.split("/") if part]
+
+            if normalized_path == "/api/passport-batches":
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = passport_batch_repository.list_batches(
+                        status=params.get("status", [""])[0],
+                        keyword=params.get("keyword", [""])[0],
+                        page=int(params.get("page", ["1"])[0] or "1"),
+                        page_size=int(params.get("page_size", ["20"])[0] or "20"),
+                        sort=params.get("sort", ["created_desc"])[0] or "created_desc",
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_BATCH_LIST error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 5
+                and path_parts[0:2] == ["api", "passport-batches"]
+                and path_parts[2] == "items"
+                and path_parts[4] == "image"
+            ):
+                try:
+                    self.validate_read_api_key()
+                    image = passport_batch_repository.get_item_image(path_parts[3])
+                    self.send_file(
+                        image["path"],
+                        image["content_type"],
+                        image["file_name"],
+                    )
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except (ItemNotFoundError, FileNotFoundError) as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_BATCH_IMAGE error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 4
+                and path_parts[0:2] == ["api", "passport-batches"]
+                and path_parts[3] == "items"
+            ):
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = passport_batch_repository.list_items(
+                        path_parts[2],
+                        status=params.get("status", [""])[0],
+                        review_status=params.get("review_status", [""])[0],
+                        page=int(params.get("page", ["1"])[0] or "1"),
+                        page_size=int(params.get("page_size", ["50"])[0] or "50"),
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except BatchNotFoundError as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_BATCH_ITEM_LIST error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 5
+                and path_parts[0:2] == ["api", "passport-batches"]
+                and path_parts[3] == "review"
+                and path_parts[4] in {"next", "previous"}
+            ):
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = passport_batch_repository.get_review_item(
+                        path_parts[2],
+                        direction=path_parts[4],
+                        current_item_key=params.get("current_item_key", [""])[0] or None,
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except (BatchNotFoundError, ItemNotFoundError) as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_BATCH_REVIEW_NAV error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
                 return
             if parsed_url.path in {
                 "/passport-face-match/runtime",
@@ -496,6 +677,118 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         def do_POST(self) -> None:
             log_api(f"POST {self.path}")
             parsed_url = urlparse(self.path)
+            if parsed_url.path.rstrip("/") == "/api/passport-batches/items/review":
+                try:
+                    payload = self.read_json_body()
+                    if api_key:
+                        provided_key = str(
+                            self.headers.get("X-API-Key")
+                            or payload.get("api_key")
+                            or payload.get("key")
+                            or ""
+                        ).strip()
+                        if provided_key != api_key:
+                            raise PermissionError("Invalid API key")
+                    item_identifier = payload.get("id") or payload.get("item_key")
+                    review_status = payload.get("review_status") or payload.get("status")
+                    result = passport_batch_repository.update_review_status(
+                        item_identifier,
+                        str(review_status or ""),
+                        reviewed_by=payload.get("reviewed_by"),
+                        review_note=payload.get("review_note") or payload.get("note"),
+                    )
+                    log_api(
+                        "PASSPORT_BATCH_REVIEW_UPDATE done "
+                        f"item={item_identifier} status={review_status}"
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except ItemNotFoundError as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ReviewConflictError as exc:
+                    self.send_json(409, {"status": "error", "error": str(exc)})
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_BATCH_REVIEW_UPDATE error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path in {"/passport-batches", "/api/passport-batches"}:
+                try:
+                    content_type = self.headers.get("Content-Type", "")
+                    length = int(self.headers.get("Content-Length", "0"))
+                    if length <= 0:
+                        raise ValueError("Request body is empty")
+                    batch_max_request_bytes = max(
+                        1024,
+                        int(
+                            env_value(
+                                server_env,
+                                "READMRZ_PASSPORT_BATCH_MAX_REQUEST_BYTES",
+                                str(max_request_bytes),
+                            )
+                        ),
+                    )
+                    if length > batch_max_request_bytes:
+                        self.send_json(
+                            413,
+                            {
+                                "status": "error",
+                                "error": (
+                                    "Request body is too large. "
+                                    f"Max allowed is {batch_max_request_bytes} bytes."
+                                ),
+                            },
+                        )
+                        return
+                    files, fields = parse_multipart_form(content_type, self.rfile.read(length))
+                    if api_key:
+                        provided_key = str(
+                            self.headers.get("X-API-Key")
+                            or fields.get("api_key")
+                            or fields.get("key")
+                            or ""
+                        ).strip()
+                        if provided_key != api_key:
+                            raise PermissionError("Invalid API key")
+
+                    metadata = None
+                    metadata_text = fields.get("metadata_json") or fields.get("metadata")
+                    if metadata_text:
+                        metadata = json.loads(metadata_text)
+                        if not isinstance(metadata, dict):
+                            raise ValueError("metadata_json must contain a JSON object")
+
+                    result = passport_batch_repository.create_batch(
+                        files,
+                        client_request_id=(
+                            fields.get("client_request_id")
+                            or self.headers.get("X-Client-Request-Id")
+                        ),
+                        source_system=fields.get("source_system"),
+                        requested_by=fields.get("requested_by"),
+                        metadata=metadata,
+                    )
+                    if passport_batch_worker is not None:
+                        passport_batch_worker.wake()
+                    log_api(
+                        "PASSPORT_BATCH_UPLOAD accepted "
+                        f"batch_id={result['batch_id']} received={result['received']}"
+                    )
+                    self.send_json(202, result)
+                except PermissionError as exc:
+                    log_api(f"PASSPORT_BATCH_UPLOAD auth_error {exc}")
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except (ValueError, json.JSONDecodeError) as exc:
+                    log_api(f"PASSPORT_BATCH_UPLOAD bad_request {exc}")
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_BATCH_UPLOAD error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
             if parsed_url.path == "/label-review/decision":
                 try:
                     length = int(self.headers.get("Content-Length", "0"))
@@ -1042,13 +1335,19 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
             return
 
     server = LimitedThreadingHTTPServer((host, port), Handler, max_workers=max_http_threads)
+    if passport_batch_worker is not None:
+        passport_batch_worker.start()
     display_host = "127.0.0.1" if host in {"0.0.0.0", "::"} else host
     log_api(f"READMRZ server listening on http://{display_host}:{port} bind={host}:{port}")
     log_api("MRZ read endpoint: POST /yolo-mrz-read-base64")
+    log_api("Passport batch upload endpoint: POST /api/passport-batches")
+    log_api("Passport batch query endpoint: GET /api/passport-batches")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
         return 0
     finally:
+        if passport_batch_worker is not None:
+            passport_batch_worker.stop()
         server.server_close()
     return 0
