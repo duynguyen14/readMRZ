@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
+import calendar
 from email import policy
 from email.parser import BytesParser
 import hashlib
@@ -278,7 +279,30 @@ class PassportBatchRepository:
                     SUM(CASE WHEN item.ReviewStatus = N'pending' THEN 1 ELSE 0 END) AS PendingReviewItems,
                     SUM(CASE WHEN item.ReviewStatus = N'approved' THEN 1 ELSE 0 END) AS ApprovedItems,
                     SUM(CASE WHEN item.ReviewStatus = N'corrected' THEN 1 ELSE 0 END) AS CorrectedItems,
-                    SUM(CASE WHEN item.ReviewStatus = N'rejected' THEN 1 ELSE 0 END) AS RejectedItems
+                    SUM(CASE WHEN item.ReviewStatus = N'rejected' THEN 1 ELSE 0 END) AS RejectedItems,
+                    SUM(CASE WHEN item.Status = N'succeeded' AND item.DateOfBirth IS NOT NULL
+                              AND item.DateOfBirth <= CONVERT(date, GETDATE())
+                              AND DATEADD(YEAR, 14, item.DateOfBirth) > CONVERT(date, GETDATE())
+                             THEN 1 ELSE 0 END) AS ChildPassportItems,
+                    SUM(CASE WHEN item.Status = N'succeeded' AND item.DateOfBirth IS NOT NULL
+                              AND item.DateOfBirth <= CONVERT(date, GETDATE())
+                              AND DATEADD(YEAR, 14, item.DateOfBirth) <= CONVERT(date, GETDATE())
+                             THEN 1 ELSE 0 END) AS AdultPassportItems,
+                    SUM(CASE WHEN item.Status = N'succeeded'
+                              AND (item.DateOfBirth IS NULL OR item.DateOfBirth > CONVERT(date, GETDATE()))
+                             THEN 1 ELSE 0 END) AS UnknownBirthDateItems,
+                    SUM(CASE WHEN item.Status = N'succeeded' AND item.DateOfExpiry IS NOT NULL
+                              AND item.DateOfExpiry < CONVERT(date, GETDATE())
+                             THEN 1 ELSE 0 END) AS ExpiredPassportItems,
+                    SUM(CASE WHEN item.Status = N'succeeded' AND item.DateOfExpiry IS NOT NULL
+                              AND item.DateOfExpiry >= CONVERT(date, GETDATE())
+                              AND item.DateOfExpiry < DATEADD(MONTH, 6, CONVERT(date, GETDATE()))
+                             THEN 1 ELSE 0 END) AS ExpiringWithinSixMonthsItems,
+                    SUM(CASE WHEN item.Status = N'succeeded' AND item.DateOfExpiry IS NOT NULL
+                              AND item.DateOfExpiry >= DATEADD(MONTH, 6, CONVERT(date, GETDATE()))
+                             THEN 1 ELSE 0 END) AS ValidSixMonthsOrMoreItems,
+                    SUM(CASE WHEN item.Status = N'succeeded' AND item.DateOfExpiry IS NULL
+                             THEN 1 ELSE 0 END) AS UnknownExpiryDateItems
                 FROM dbo.readmrz_passport_batches batch
                 LEFT JOIN dbo.readmrz_passport_items item ON item.BatchId = batch.Id
                 {where_sql}
@@ -587,7 +611,30 @@ class PassportBatchRepository:
                 SUM(CASE WHEN ReviewStatus = N'pending' THEN 1 ELSE 0 END) AS PendingReviewItems,
                 SUM(CASE WHEN ReviewStatus = N'approved' THEN 1 ELSE 0 END) AS ApprovedItems,
                 SUM(CASE WHEN ReviewStatus = N'corrected' THEN 1 ELSE 0 END) AS CorrectedItems,
-                SUM(CASE WHEN ReviewStatus = N'rejected' THEN 1 ELSE 0 END) AS RejectedItems
+                SUM(CASE WHEN ReviewStatus = N'rejected' THEN 1 ELSE 0 END) AS RejectedItems,
+                SUM(CASE WHEN Status = N'succeeded' AND DateOfBirth IS NOT NULL
+                          AND DateOfBirth <= CONVERT(date, GETDATE())
+                          AND DATEADD(YEAR, 14, DateOfBirth) > CONVERT(date, GETDATE())
+                         THEN 1 ELSE 0 END) AS ChildPassportItems,
+                SUM(CASE WHEN Status = N'succeeded' AND DateOfBirth IS NOT NULL
+                          AND DateOfBirth <= CONVERT(date, GETDATE())
+                          AND DATEADD(YEAR, 14, DateOfBirth) <= CONVERT(date, GETDATE())
+                         THEN 1 ELSE 0 END) AS AdultPassportItems,
+                SUM(CASE WHEN Status = N'succeeded'
+                          AND (DateOfBirth IS NULL OR DateOfBirth > CONVERT(date, GETDATE()))
+                         THEN 1 ELSE 0 END) AS UnknownBirthDateItems,
+                SUM(CASE WHEN Status = N'succeeded' AND DateOfExpiry IS NOT NULL
+                          AND DateOfExpiry < CONVERT(date, GETDATE())
+                         THEN 1 ELSE 0 END) AS ExpiredPassportItems,
+                SUM(CASE WHEN Status = N'succeeded' AND DateOfExpiry IS NOT NULL
+                          AND DateOfExpiry >= CONVERT(date, GETDATE())
+                          AND DateOfExpiry < DATEADD(MONTH, 6, CONVERT(date, GETDATE()))
+                         THEN 1 ELSE 0 END) AS ExpiringWithinSixMonthsItems,
+                SUM(CASE WHEN Status = N'succeeded' AND DateOfExpiry IS NOT NULL
+                          AND DateOfExpiry >= DATEADD(MONTH, 6, CONVERT(date, GETDATE()))
+                         THEN 1 ELSE 0 END) AS ValidSixMonthsOrMoreItems,
+                SUM(CASE WHEN Status = N'succeeded' AND DateOfExpiry IS NULL
+                         THEN 1 ELSE 0 END) AS UnknownExpiryDateItems
             FROM dbo.readmrz_passport_items
             WHERE BatchId = ?
             """,
@@ -1078,6 +1125,13 @@ def _statistics_payload(row: dict[str, Any]) -> dict[str, Any]:
     approved = _int_value(row.get("ApprovedItems"))
     corrected = _int_value(row.get("CorrectedItems"))
     rejected = _int_value(row.get("RejectedItems"))
+    child_passports = _int_value(row.get("ChildPassportItems"))
+    adult_passports = _int_value(row.get("AdultPassportItems"))
+    unknown_birth_date = _int_value(row.get("UnknownBirthDateItems"))
+    expired_passports = _int_value(row.get("ExpiredPassportItems"))
+    expiring_within_6_months = _int_value(row.get("ExpiringWithinSixMonthsItems"))
+    valid_6_months_or_more = _int_value(row.get("ValidSixMonthsOrMoreItems"))
+    unknown_expiry_date = _int_value(row.get("UnknownExpiryDateItems"))
     reviewed = approved + corrected + rejected
     terminal = succeeded + failed + cancelled
     review_ready = reviewed + pending
@@ -1095,6 +1149,13 @@ def _statistics_payload(row: dict[str, Any]) -> dict[str, Any]:
         "approved": approved,
         "corrected": corrected,
         "rejected": rejected,
+        "child_passports": child_passports,
+        "adult_passports": adult_passports,
+        "unknown_birth_date": unknown_birth_date,
+        "expired_passports": expired_passports,
+        "expiring_within_6_months": expiring_within_6_months,
+        "valid_6_months_or_more": valid_6_months_or_more,
+        "unknown_expiry_date": unknown_expiry_date,
         "processing_progress_percent": _percent(terminal, total),
         "review_progress_percent": _percent(reviewed, review_ready),
     }
@@ -1148,6 +1209,10 @@ def _item_payload(row: dict[str, Any], *, include_result: bool) -> dict[str, Any
             "date_of_expiry": _iso_value(row.get("DateOfExpiry")),
             "personal_number": row.get("PersonalNumber"),
         },
+        "classification": _passport_classification(
+            row.get("DateOfBirth"),
+            row.get("DateOfExpiry"),
+        ),
         "created_at": _iso_value(row.get("CreatedDate")),
         "updated_at": _iso_value(row.get("UpdatedDate")),
     }
@@ -1155,6 +1220,71 @@ def _item_payload(row: dict[str, Any], *, include_result: bool) -> dict[str, Any
         payload["ai_result"] = _json_load(row.get("ResultJson"))
         payload["reviewed_result"] = _json_load(row.get("ReviewedResultJson"))
     return payload
+
+
+def _passport_classification(
+    birth_date: Any,
+    expiry_date: Any,
+    *,
+    today: date | None = None,
+) -> dict[str, Any]:
+    reference_date = today or date.today()
+    normalized_birth_date = _date_value(birth_date)
+    normalized_expiry_date = _date_value(expiry_date)
+
+    age_years: int | None = None
+    age_group = "unknown"
+    if normalized_birth_date is not None and normalized_birth_date <= reference_date:
+        age_years = reference_date.year - normalized_birth_date.year
+        if reference_date < _add_years(normalized_birth_date, age_years):
+            age_years -= 1
+        age_group = "child" if reference_date < _add_years(normalized_birth_date, 14) else "adult"
+
+    validity_status = "unknown"
+    days_to_expiry: int | None = None
+    if normalized_expiry_date is not None:
+        days_to_expiry = (normalized_expiry_date - reference_date).days
+        if normalized_expiry_date < reference_date:
+            validity_status = "expired"
+        elif normalized_expiry_date < _add_months(reference_date, 6):
+            validity_status = "expiring_within_6_months"
+        else:
+            validity_status = "valid_6_months_or_more"
+
+    return {
+        "as_of_date": reference_date.isoformat(),
+        "age_years": age_years,
+        "age_group": age_group,
+        "validity_status": validity_status,
+        "days_to_expiry": days_to_expiry,
+    }
+
+
+def _date_value(value: Any) -> date | None:
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    if isinstance(value, str):
+        try:
+            return date.fromisoformat(value.strip()[:10])
+        except (TypeError, ValueError):
+            return None
+    return None
+
+
+def _add_years(value: date, years: int) -> date:
+    target_year = value.year + years
+    target_day = min(value.day, calendar.monthrange(target_year, value.month)[1])
+    return date(target_year, value.month, target_day)
+
+
+def _add_months(value: date, months: int) -> date:
+    month_index = value.month - 1 + months
+    target_year = value.year + month_index // 12
+    target_month = month_index % 12 + 1
+    target_day = min(value.day, calendar.monthrange(target_year, target_month)[1])
+    return date(target_year, target_month, target_day)
 
 
 def _normalize_uuid(value: str, field_name: str) -> UUID:

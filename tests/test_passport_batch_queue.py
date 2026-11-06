@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import unittest
+from datetime import date, datetime
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -8,6 +9,7 @@ from mrz_reader.passport_batch_queue import (
     PassportBatchRepository,
     _item_identifier_lookup,
     _pagination,
+    _passport_classification,
     _statistics_payload,
     _validated_filter,
     parse_multipart_form,
@@ -72,6 +74,13 @@ class MultipartFormTests(unittest.TestCase):
                 "ApprovedItems": 2,
                 "CorrectedItems": 1,
                 "RejectedItems": 1,
+                "ChildPassportItems": 2,
+                "AdultPassportItems": 3,
+                "UnknownBirthDateItems": 1,
+                "ExpiredPassportItems": 1,
+                "ExpiringWithinSixMonthsItems": 2,
+                "ValidSixMonthsOrMoreItems": 2,
+                "UnknownExpiryDateItems": 1,
             }
         )
 
@@ -79,6 +88,34 @@ class MultipartFormTests(unittest.TestCase):
         self.assertEqual(statistics["unreviewed"], 2)
         self.assertEqual(statistics["processing_progress_percent"], 70.0)
         self.assertEqual(statistics["review_progress_percent"], 66.67)
+        self.assertEqual(statistics["child_passports"], 2)
+        self.assertEqual(statistics["expiring_within_6_months"], 2)
+
+    def test_passport_classification_respects_age_and_expiry_boundaries(self) -> None:
+        today = date(2026, 11, 6)
+
+        child = _passport_classification(
+            datetime(2012, 11, 7),
+            datetime(2027, 5, 5),
+            today=today,
+        )
+        self.assertEqual(child["age_group"], "child")
+        self.assertEqual(child["age_years"], 13)
+        self.assertEqual(child["validity_status"], "expiring_within_6_months")
+
+        boundary = _passport_classification(
+            date(2012, 11, 6),
+            date(2027, 5, 6),
+            today=today,
+        )
+        self.assertEqual(boundary["age_group"], "adult")
+        self.assertEqual(boundary["age_years"], 14)
+        self.assertEqual(boundary["validity_status"], "valid_6_months_or_more")
+
+        expired = _passport_classification(None, date(2026, 11, 5), today=today)
+        self.assertEqual(expired["age_group"], "unknown")
+        self.assertEqual(expired["validity_status"], "expired")
+        self.assertEqual(expired["days_to_expiry"], -1)
 
     def test_filters_and_pagination_are_bounded(self) -> None:
         self.assertEqual(_pagination(0, 999), (1, 200, 0))
