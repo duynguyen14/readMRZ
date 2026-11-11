@@ -202,6 +202,60 @@ POST http://127.0.0.1:8080/api/passport-face-match/batch
 
 Unmatched input is still returned as `{ "face": {...}, "passport": null }` or `{ "face": null, "passport": {...} }`.
 
+## Evaluate exported passport folders
+
+The evaluation tool reads only image files under this export structure:
+
+```text
+EXPORT_ROOT/
+  CHN/
+    hochieuhethan/passport/
+    conhanduoi6thang/passport/
+    conhantren6thang/passport/
+```
+
+It runs the same orientation, YOLO MRZ, OCR and ICAO parsing pipeline used by the API. The
+folder name is treated as the expected expiry class. OCR results, age group, actual expiry
+class, country comparison, checksum, confidence, processing time and errors are stored in
+`dbo.readmrz_passport_evaluation_runs` and `dbo.readmrz_passport_evaluation_items`.
+
+Scan the folders without loading models or writing to SQL Server:
+
+```powershell
+python tools\evaluate_exported_passports.py `
+  "C:\Users\Administrator\Downloads\quick_20261016_094736\quick_20261016_094736" `
+  --dry-run
+```
+
+Create the schema automatically and run the full evaluation:
+
+```powershell
+python tools\evaluate_exported_passports.py `
+  "C:\Users\Administrator\Downloads\quick_20261016_094736\quick_20261016_094736" `
+  --run-name "Bao cao quick 20261016"
+```
+
+For a folder named `quick_YYYYMMDD_HHMMSS`, the tool automatically uses `YYYYMMDD` as the
+reference date so the comparison matches the date used during export. For other folder
+names it uses the day the tool runs. Override either behavior explicitly when needed:
+
+```powershell
+python tools\evaluate_exported_passports.py "C:\path\to\quick_export" `
+  --reference-date 2026-10-16
+```
+
+If execution is interrupted, use the printed numeric run ID to continue. Items left in
+`processing` are automatically returned to the queue:
+
+```powershell
+python tools\evaluate_exported_passports.py --resume-run-id 12
+```
+
+Add `--retry-failed` to retry files that previously failed. The view
+`dbo.vw_readmrz_passport_evaluation_summary` contains the final run totals and accuracy.
+`dbo.vw_readmrz_passport_evaluation_issues` lists files that failed OCR, were assigned to
+the wrong expiry group, or returned a country code different from the source folder.
+
 ## Async face/passport matching jobs
 
 The existing synchronous batch endpoint above is unchanged. For large mixed uploads, create

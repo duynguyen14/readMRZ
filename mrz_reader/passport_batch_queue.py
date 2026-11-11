@@ -2,7 +2,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from datetime import date, datetime
-import calendar
 from email import policy
 from email.parser import BytesParser
 import hashlib
@@ -18,6 +17,7 @@ import cv2
 
 from .db import connect
 from .env_config import env_value, read_env_file
+from .passport_classification import classify_passport_dates
 
 
 SUPPORTED_IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".tif", ".tiff", ".webp"}
@@ -1228,63 +1228,14 @@ def _passport_classification(
     *,
     today: date | None = None,
 ) -> dict[str, Any]:
-    reference_date = today or date.today()
-    normalized_birth_date = _date_value(birth_date)
-    normalized_expiry_date = _date_value(expiry_date)
-
-    age_years: int | None = None
-    age_group = "unknown"
-    if normalized_birth_date is not None and normalized_birth_date <= reference_date:
-        age_years = reference_date.year - normalized_birth_date.year
-        if reference_date < _add_years(normalized_birth_date, age_years):
-            age_years -= 1
-        age_group = "child" if reference_date < _add_years(normalized_birth_date, 14) else "adult"
-
-    validity_status = "unknown"
-    days_to_expiry: int | None = None
-    if normalized_expiry_date is not None:
-        days_to_expiry = (normalized_expiry_date - reference_date).days
-        if normalized_expiry_date < reference_date:
-            validity_status = "expired"
-        elif normalized_expiry_date < _add_months(reference_date, 6):
-            validity_status = "expiring_within_6_months"
-        else:
-            validity_status = "valid_6_months_or_more"
-
-    return {
-        "as_of_date": reference_date.isoformat(),
-        "age_years": age_years,
-        "age_group": age_group,
-        "validity_status": validity_status,
-        "days_to_expiry": days_to_expiry,
-    }
-
-
-def _date_value(value: Any) -> date | None:
-    if isinstance(value, datetime):
-        return value.date()
-    if isinstance(value, date):
-        return value
-    if isinstance(value, str):
-        try:
-            return date.fromisoformat(value.strip()[:10])
-        except (TypeError, ValueError):
-            return None
-    return None
-
-
-def _add_years(value: date, years: int) -> date:
-    target_year = value.year + years
-    target_day = min(value.day, calendar.monthrange(target_year, value.month)[1])
-    return date(target_year, value.month, target_day)
-
-
-def _add_months(value: date, months: int) -> date:
-    month_index = value.month - 1 + months
-    target_year = value.year + month_index // 12
-    target_month = month_index % 12 + 1
-    target_day = min(value.day, calendar.monthrange(target_year, target_month)[1])
-    return date(target_year, target_month, target_day)
+    payload = classify_passport_dates(
+        birth_date,
+        expiry_date,
+        reference_date=today,
+    )
+    payload.pop("birth_date", None)
+    payload.pop("expiry_date", None)
+    return payload
 
 
 def _normalize_uuid(value: str, field_name: str) -> UUID:
