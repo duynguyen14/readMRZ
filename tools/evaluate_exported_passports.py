@@ -566,8 +566,10 @@ def main() -> int:
     print(f"Evaluation run: id={run_id} key={run_key}")
     print("Loading MRZ pipeline models...")
     try:
-        orientation = PaddleDocumentOrientation()
+        # On Windows, load Ultralytics/PyTorch before PaddleOCR. Loading Paddle first can
+        # make modelscope import torch afterwards and fail on torch/lib/shm.dll (WinError 127).
         detector = YoloMrzDetector()
+        orientation = PaddleDocumentOrientation()
         recognizer = CustomMrzCtcRecognizer()
         print(
             "Loaded models "
