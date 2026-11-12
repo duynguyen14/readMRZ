@@ -173,6 +173,7 @@ class PassportEvaluationReviewRepository:
         *,
         reviewed_by: str | None = None,
         review_note: str | None = None,
+        is_poor_quality_image: bool = False,
     ) -> dict[str, Any]:
         item_uuid = _uuid(item_key, "item_key")
         normalized_status = str(review_status or "").strip().lower()
@@ -190,6 +191,7 @@ class PassportEvaluationReviewRepository:
                     ReviewBasis = ?,
                     ReviewedBy = ?,
                     ReviewNote = ?,
+                    IsPoorQualityImage = ?,
                     ReviewedAt = SYSUTCDATETIME(),
                     ReviewUpdatedAt = SYSUTCDATETIME(),
                     UpdatedDate = SYSUTCDATETIME()
@@ -200,6 +202,7 @@ class PassportEvaluationReviewRepository:
                 "human_approved" if normalized_status == "approved" else "human_rejected",
                 reviewer,
                 note,
+                1 if is_poor_quality_image else 0,
                 str(item_uuid),
             )
             row = cursor.fetchone()
@@ -297,6 +300,7 @@ def _item_payload(row: dict[str, Any]) -> dict[str, Any]:
         "review_note": row.get("ReviewNote"),
         "reviewed_by": row.get("ReviewedBy"),
         "reviewed_at": _json_value(row.get("ReviewedAt")),
+        "is_poor_quality_image": bool(row.get("IsPoorQualityImage") or False),
         "checksum": {
             "read_valid": _optional_bool(row.get("ChecksumValid")),
             "source_valid": source_checksum,

@@ -1151,6 +1151,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                         str(review_status or ""),
                         reviewed_by=payload.get("reviewed_by"),
                         review_note=payload.get("review_note") or payload.get("note"),
+                        is_poor_quality_image=bool(payload.get("is_poor_quality_image", False)),
                     )
                     log_api(
                         "PASSPORT_EVALUATION_REVIEW_UPDATE done "

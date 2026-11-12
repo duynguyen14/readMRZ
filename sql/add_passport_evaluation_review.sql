@@ -17,6 +17,10 @@ IF COL_LENGTH(N'dbo.readmrz_passport_evaluation_items', N'ReviewedAt') IS NULL
     ALTER TABLE dbo.readmrz_passport_evaluation_items ADD ReviewedAt DATETIME2(3) NULL;
 IF COL_LENGTH(N'dbo.readmrz_passport_evaluation_items', N'ReviewUpdatedAt') IS NULL
     ALTER TABLE dbo.readmrz_passport_evaluation_items ADD ReviewUpdatedAt DATETIME2(3) NULL;
+IF COL_LENGTH(N'dbo.readmrz_passport_evaluation_items', N'IsPoorQualityImage') IS NULL
+    ALTER TABLE dbo.readmrz_passport_evaluation_items
+        ADD IsPoorQualityImage BIT NOT NULL
+            CONSTRAINT DF_readmrz_passport_evaluation_items_IsPoorQualityImage DEFAULT (0) WITH VALUES;
 GO
 
 /*

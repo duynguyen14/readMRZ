@@ -309,7 +309,8 @@ Approve or reject an item with:
   "item_key": "43150201-81DD-F111-B6BD-000C2986E5EF",
   "review_status": "approved",
   "reviewed_by": "operator-name",
-  "review_note": "Compared with the original passport image"
+  "review_note": "Compared with the original passport image",
+  "is_poor_quality_image": true
 }
 ```
 
