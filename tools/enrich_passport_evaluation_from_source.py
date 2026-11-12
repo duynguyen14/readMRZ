@@ -43,6 +43,7 @@ from tools.generate_evisa_mrz_ocr_line3_dataset import (  # noqa: E402
 
 
 SCHEMA_PATH = PROJECT_ROOT / "sql" / "extend_passport_evaluation_source_comparison.sql"
+REVIEW_SCHEMA_PATH = PROJECT_ROOT / "sql" / "add_passport_evaluation_review.sql"
 
 MATCH_COLUMN_BY_FIELD = {
     "mrz_line_one": "MrzLineOneMatch",
@@ -114,6 +115,41 @@ def comparison_schema_exists(cursor: Any) -> bool:
         "SELECT CASE WHEN COL_LENGTH(N'dbo.readmrz_passport_evaluation_items', N'SourceMatchStatus') IS NULL THEN 0 ELSE 1 END;"
     )
     return bool(cursor.fetchone()[0])
+
+
+def review_schema_exists(cursor: Any) -> bool:
+    cursor.execute(
+        "SELECT CASE WHEN COL_LENGTH(N'dbo.readmrz_passport_evaluation_items', N'ReviewStatus') IS NULL THEN 0 ELSE 1 END;"
+    )
+    return bool(cursor.fetchone()[0])
+
+
+def refresh_review_statuses(cursor: Any, run_id: int) -> None:
+    cursor.execute(
+        """
+        UPDATE item
+        SET ReviewStatus = CASE
+                WHEN item.ChecksumValid = 1
+                 AND item.AllComparedFieldsMatch = 1
+                 AND JSON_VALUE(item.SourceDataJson, '$.normalized_passport_fields.source_mrz_checksum_valid') = N'true'
+                    THEN N'auto_approved'
+                ELSE N'pending'
+            END,
+            ReviewBasis = CASE
+                WHEN item.ChecksumValid = 1
+                 AND item.AllComparedFieldsMatch = 1
+                 AND JSON_VALUE(item.SourceDataJson, '$.normalized_passport_fields.source_mrz_checksum_valid') = N'true'
+                    THEN N'strict_checksum_and_source_match'
+                ELSE N'requires_human_review'
+            END,
+            ReviewUpdatedAt = SYSUTCDATETIME()
+        FROM dbo.readmrz_passport_evaluation_items item
+        WHERE item.RunId = ?
+          AND item.SourceComparedAt IS NOT NULL
+          AND (item.ReviewStatus IS NULL OR item.ReviewStatus IN (N'auto_approved', N'pending'));
+        """,
+        run_id,
+    )
 
 
 def load_run(cursor: Any, run_id: int) -> dict[str, Any]:
@@ -513,6 +549,7 @@ def main() -> int:
 
     if not args.dry_run and not args.skip_schema:
         execute_sql_file(SCHEMA_PATH)
+        execute_sql_file(REVIEW_SCHEMA_PATH)
 
     with connect() as destination_connection:
         destination_cursor = destination_connection.cursor()
@@ -630,6 +667,8 @@ def main() -> int:
                 )
 
         if not args.dry_run:
+            if review_schema_exists(destination_cursor):
+                refresh_review_statuses(destination_cursor, args.run_id)
             destination_connection.commit()
 
     summary["countries"] = dict(sorted(summary["countries"].items()))

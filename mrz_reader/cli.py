@@ -75,6 +75,11 @@ from .passport_batch_queue import (
     ReviewConflictError,
     parse_multipart_form,
 )
+from .passport_evaluation_review import (
+    EvaluationItemNotFoundError,
+    EvaluationRunNotFoundError,
+    PassportEvaluationReviewRepository,
+)
 from .vn_visa_read_pipeline import VnVisaReadService
 from .vn_visa_standardize import get_vn_visa_standardizer, standardize_vn_visa_read_payload
 from .yolo_detector import YoloMrzDetector
@@ -360,6 +365,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
         )
 
     passport_batch_repository = PassportBatchRepository.from_env(server_env)
+    passport_evaluation_review_repository = PassportEvaluationReviewRepository()
     passport_batch_worker: PassportBatchWorker | None = None
 
     def process_passport_batch_image(image: np.ndarray) -> tuple[dict, dict]:
@@ -609,6 +615,71 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                 return
             normalized_path = parsed_url.path.rstrip("/") or "/"
             path_parts = [part for part in normalized_path.split("/") if part]
+
+            if normalized_path == "/api/passport-evaluation-reviews/runs":
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = passport_evaluation_review_repository.list_runs(
+                        page=int(params.get("page", ["1"])[0] or "1"),
+                        page_size=int(params.get("page_size", ["20"])[0] or "20"),
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_EVALUATION_RUN_LIST error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 5
+                and path_parts[0:3] == ["api", "passport-evaluation-reviews", "items"]
+                and path_parts[4] == "image"
+            ):
+                try:
+                    self.validate_read_api_key()
+                    image = passport_evaluation_review_repository.get_item_image(path_parts[3])
+                    self.send_file(image["path"], image["content_type"], image["file_name"])
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except (EvaluationItemNotFoundError, FileNotFoundError) as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_EVALUATION_IMAGE error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if (
+                len(path_parts) == 4
+                and path_parts[0:2] == ["api", "passport-evaluation-reviews"]
+                and path_parts[3] == "items"
+            ):
+                try:
+                    self.validate_read_api_key()
+                    params = parse_qs(parsed_url.query)
+                    result = passport_evaluation_review_repository.list_items(
+                        int(path_parts[2]),
+                        review_status=params.get("review_status", ["pending"])[0],
+                        country=params.get("country", [""])[0],
+                        page=int(params.get("page", ["1"])[0] or "1"),
+                        page_size=int(params.get("page_size", ["1"])[0] or "1"),
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except EvaluationRunNotFoundError as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except ValueError as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_EVALUATION_ITEM_LIST error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
 
             if normalized_path == "/api/passport-face-match/jobs":
                 try:
@@ -1058,6 +1129,42 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
                     self.send_json(400, {"status": "error", "error": str(exc)})
                 except Exception as exc:
                     log_api(f"PASSPORT_BATCH_REVIEW_UPDATE error {exc}")
+                    self.send_json(500, {"status": "error", "error": str(exc)})
+                return
+
+            if parsed_url.path.rstrip("/") == "/api/passport-evaluation-reviews/items/review":
+                try:
+                    payload = self.read_json_body()
+                    if api_key:
+                        provided_key = str(
+                            self.headers.get("X-API-Key")
+                            or payload.get("api_key")
+                            or payload.get("key")
+                            or ""
+                        ).strip()
+                        if provided_key != api_key:
+                            raise PermissionError("Invalid API key")
+                    item_identifier = payload.get("id") or payload.get("item_key")
+                    review_status = payload.get("review_status") or payload.get("status")
+                    result = passport_evaluation_review_repository.update_review(
+                        str(item_identifier or ""),
+                        str(review_status or ""),
+                        reviewed_by=payload.get("reviewed_by"),
+                        review_note=payload.get("review_note") or payload.get("note"),
+                    )
+                    log_api(
+                        "PASSPORT_EVALUATION_REVIEW_UPDATE done "
+                        f"item={item_identifier} status={review_status}"
+                    )
+                    self.send_json(200, result)
+                except PermissionError as exc:
+                    self.send_json(401, {"status": "error", "error": str(exc)})
+                except EvaluationItemNotFoundError as exc:
+                    self.send_json(404, {"status": "error", "error": str(exc)})
+                except (ValueError, json.JSONDecodeError) as exc:
+                    self.send_json(400, {"status": "error", "error": str(exc)})
+                except Exception as exc:
+                    log_api(f"PASSPORT_EVALUATION_REVIEW_UPDATE error {exc}")
                     self.send_json(500, {"status": "error", "error": str(exc)})
                 return
 
@@ -1690,6 +1797,7 @@ def run_server(port: int, *, host: str = "127.0.0.1") -> int:
     log_api("MRZ read endpoint: POST /yolo-mrz-read-base64")
     log_api("Passport batch upload endpoint: POST /api/passport-batches")
     log_api("Passport batch query endpoint: GET /api/passport-batches")
+    log_api("Passport evaluation review endpoint: GET /api/passport-evaluation-reviews/{run_id}/items")
     log_api("Async face match upload endpoint: POST /api/passport-face-match/jobs")
     log_api("Async face match query endpoint: GET /api/passport-face-match/jobs/{job_id}")
     try:

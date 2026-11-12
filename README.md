@@ -286,6 +286,33 @@ Use `--force` to recompute items that already have `SourceComparedAt`. The view
 mismatches by run and country. Each item also keeps `SourceDataJson` and `ComparisonJson`
 for audit and troubleshooting.
 
+### Human review for passport evaluation mismatches
+
+The source-enrichment command also applies `sql/add_passport_evaluation_review.sql`.
+Compared items are classified as `auto_approved` only when the new ICAO checksum passes,
+all comparable fields match, and the source MRZ checksum also passes. Every other compared
+item becomes `pending`; existing human `approved` and `rejected` decisions are preserved.
+
+Review endpoints (send `X-API-Key` when `READMRZ_API_KEY` is configured):
+
+```text
+GET  /api/passport-evaluation-reviews/runs
+GET  /api/passport-evaluation-reviews/{run_id}/items?review_status=pending&page=1&page_size=1
+GET  /api/passport-evaluation-reviews/items/{item_key}/image
+POST /api/passport-evaluation-reviews/items/review
+```
+
+Approve or reject an item with:
+
+```json
+{
+  "item_key": "43150201-81DD-F111-B6BD-000C2986E5EF",
+  "review_status": "approved",
+  "reviewed_by": "operator-name",
+  "review_note": "Compared with the original passport image"
+}
+```
+
 ## Async face/passport matching jobs
 
 The existing synchronous batch endpoint above is unchanged. For large mixed uploads, create
