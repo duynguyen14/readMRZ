@@ -256,6 +256,36 @@ Add `--retry-failed` to retry files that previously failed. The view
 `dbo.vw_readmrz_passport_evaluation_issues` lists files that failed OCR, were assigned to
 the wrong expiry group, or returned a country code different from the source folder.
 
+### Compare evaluation OCR with the original TransactionEVisa data
+
+After an evaluation run is complete, enrich each item with its original
+`db_dichvu_visa.dbo.TransactionEVisa` row and compare the newly read values with the old
+MRZ/passport values. The matcher uses the original exported filename first, supports the
+`_1`, `_2`, ... collision suffix used by the exporter, and refuses to guess when multiple
+source rows remain tied.
+
+Preview the matching result without changing the destination schema or data:
+
+```powershell
+python tools\enrich_passport_evaluation_from_source.py `
+  --run-id 2 `
+  --dry-run `
+  --no-hash
+```
+
+Remove `--no-hash` when the configured source image root is accessible; SHA-256 is then
+used to disambiguate duplicate filenames. Apply the idempotent schema migration and store
+the source snapshot plus field-by-field results:
+
+```powershell
+python tools\enrich_passport_evaluation_from_source.py --run-id 2
+```
+
+Use `--force` to recompute items that already have `SourceComparedAt`. The view
+`dbo.vw_readmrz_passport_source_comparison_by_country` summarizes source matches and
+mismatches by run and country. Each item also keeps `SourceDataJson` and `ComparisonJson`
+for audit and troubleshooting.
+
 ## Async face/passport matching jobs
 
 The existing synchronous batch endpoint above is unchanged. For large mixed uploads, create

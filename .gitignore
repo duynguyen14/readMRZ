@@ -17,3 +17,4 @@ face_match_jobs/
 # Local IDE/runtime folders
 .idea/
 .venv/
+outputs
